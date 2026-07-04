@@ -13,11 +13,13 @@
 """
 import os
 import re
+import csv
 import json
 import datetime
 import threading
 from zoneinfo import ZoneInfo
 
+import scanner
 import stock_core
 
 _BKK = ZoneInfo("Asia/Bangkok")
@@ -251,13 +253,82 @@ def format_f45_summary(f45) -> str:
     return f"{label}: {body}"
 
 
+# ── เกณฑ์ "งบโตแรง" (ตรงกับ workflow: โต ≥30% YoY หรือพลิกเป็นกำไร) ──
+
+MIN_STRONG_GROWTH_PCT = 30
+
+
+def f45_growth_pct(parsed):
+    """%YoY เทียบปีก่อน — None ถ้าปีก่อนไม่มีกำไรให้เทียบ"""
+    if parsed["profit_prior"] > 0:
+        return (parsed["profit_cur"] - parsed["profit_prior"]) / parsed["profit_prior"] * 100
+    return None
+
+
+def f45_is_strong(parsed) -> bool:
+    if parsed["profit_cur"] <= 0:
+        return False
+    if parsed["profit_prior"] <= 0:
+        return True  # พลิกเป็นกำไร
+    return f45_growth_pct(parsed) >= MIN_STRONG_GROWTH_PCT
+
+
+# ── สะสมตัวเลขงบลงไฟล์ (ไว้วิเคราะห์ว่างบโต → drift แรงจริงไหม) ──
+
+_RESULTS_PATH = os.path.join(_BASE_DIR, "earnings_results.csv")
+
+
+def _log_f45_result(entry):
+    """ต่อท้าย earnings_results.csv — กันซ้ำด้วย (หุ้น, งวด, ปี)
+    เพราะคำสั่ง "ข่าวงบ" อ่าน F45 ฉบับเดิมซ้ำได้หลายรอบ"""
+    parsed = entry.get("f45_data")
+    if not parsed:
+        return
+    key = (entry["symbol"], parsed.get("period") or "", str(parsed.get("year") or ""))
+    try:
+        with open(_RESULTS_PATH, encoding="utf-8-sig") as f:
+            for r in csv.DictReader(f):
+                if (r["symbol"], r["period"], r["year"]) == key:
+                    return
+    except FileNotFoundError:
+        pass
+    is_new = not os.path.exists(_RESULTS_PATH)
+    try:
+        with open(_RESULTS_PATH, "a", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            if is_new:
+                w.writerow(["news_datetime", "symbol", "period", "year",
+                            "profit_mb", "profit_prior_mb", "yoy_pct", "summary"])
+            g = f45_growth_pct(parsed)
+            w.writerow([
+                entry["datetime"].strftime("%Y-%m-%d %H:%M"),
+                entry["symbol"],
+                parsed.get("period") or "",
+                parsed.get("year") or "",
+                f"{parsed['profit_cur'] / 1e6:.2f}",
+                f"{parsed['profit_prior'] / 1e6:.2f}",
+                f"{g:.1f}" if g is not None else "",
+                entry.get("f45") or "",
+            ])
+    except Exception:
+        pass  # ไฟล์เปิดค้างใน Excel ฯลฯ — อย่าให้ล้มการแจ้งเตือน
+
+
 def _attach_f45_summaries(by_symbol):
-    """เติมสรุปตัวเลข F45 ("f45" key) ให้หุ้นที่มีข่าว F45 ใน dict ผลลัพธ์"""
+    """เติมสรุปตัวเลข F45 ("f45"/"f45_data") ให้หุ้นที่มีข่าว F45
+    และบันทึกตัวเลขลง earnings_results.csv"""
     targets = {sym: e["f45_url"] for sym, e in by_symbol.items() if e.get("f45_url")}
     if not targets:
         return
-    # ตัดจำนวนเมื่อวันพีค — เรียงตามเวลาข่าวใหม่สุดก่อน
-    ordered = sorted(targets, key=lambda s: by_symbol[s]["datetime"], reverse=True)
+    # จัดคิวเมื่อวันพีคเกินโควตา: หุ้นในลิสต์ติดตาม/universe ได้อ่านก่อน
+    # ที่เหลือเรียงตามเวลาข่าวใหม่สุด
+    watch = set(stock_core.get_watchlist())
+    uni = set(scanner.load_universe())
+    ordered = sorted(
+        targets,
+        key=lambda s: (0 if (s in watch or s in uni) else 1,
+                       -by_symbol[s]["datetime"].timestamp()),
+    )
     urls = [targets[s] for s in ordered[:F45_DETAIL_MAX]]
     try:
         details = fetch_news_details(urls)
@@ -270,6 +341,8 @@ def _attach_f45_summaries(by_symbol):
         parsed = parse_f45(text)
         if parsed:
             by_symbol[sym]["f45"] = format_f45_summary(parsed)
+            by_symbol[sym]["f45_data"] = parsed
+            _log_f45_result(by_symbol[sym])
 
 
 # ── แยกประเภทข่าว "งบออกแล้ว" ───────────────────────────────────

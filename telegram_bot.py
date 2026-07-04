@@ -325,6 +325,47 @@ def _in_news_window(t: datetime.time) -> bool:
             or datetime.time(17, 0) <= t <= datetime.time(21, 45))
 
 
+def build_news_alert_text(hits) -> str:
+    """ประกอบข้อความแจ้งเตือนข่าวงบ — คืนพีคมีบริษัทยื่นเป็นร้อย
+    จึงแสดงเต็มเฉพาะ "ตัวเด่น" (อยู่ในลิสต์/universe หรืองบโตแรง 🔥)
+    ที่เหลือรวบเป็นสรุปย่อท้ายข้อความ กันแจ้งเตือนท่วม"""
+    watch = set(stock_core.get_watchlist())
+    uni = set(scanner.load_universe())
+    top, rest = [], []
+    for h in hits:
+        parsed = h.get("f45_data")
+        strong = parsed is not None and set_news.f45_is_strong(parsed)
+        if h["symbol"] in watch or h["symbol"] in uni or strong:
+            top.append((h, strong))
+        else:
+            rest.append(h)
+
+    lines = ["📢 <b>บริษัทแจ้งผลประกอบการ (ข่าว SET)</b>", ""]
+    for h, strong in top:
+        star = "  ⭐ อยู่ในลิสต์" if h["symbol"] in watch else ""
+        fire = " 🔥 งบโตแรง" if strong else ""
+        lines.append(
+            f"• <b>{html.escape(h['symbol'])}</b> {h['datetime']:%H:%M} น. — "
+            f"{'/'.join(h['kinds'])}{fire}{star}"
+        )
+        if h.get("f45"):
+            lines.append(f"    {html.escape(h['f45'])}")
+    if rest:
+        shown = ", ".join(html.escape(h["symbol"]) for h in rest[:30])
+        if len(rest) > 30:
+            shown += f" ...(+{len(rest) - 30})"
+        if top:
+            lines.append("")
+        lines.append(f"อีก {len(rest)} บริษัท: {shown}")
+        lines.append("(ดูรายละเอียด: พิมพ์ <code>ข่าวงบ</code>)")
+    lines += [
+        "",
+        "บันทึกวันงบให้อัตโนมัติแล้ว — ดูปฏิกิริยาราคา: พิมพ์ชื่อหุ้น",
+        "ตัวที่ตอบรับดีจะติดสแกนรอบ 17:30 (หรือพิมพ์ <code>สแกน</code>)",
+    ]
+    return "\n".join(lines)
+
+
 async def news_monitor_job(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
     if now.weekday() >= 5 or _is_market_holiday(now.date()):
@@ -341,22 +382,7 @@ async def news_monitor_job(context: ContextTypes.DEFAULT_TYPE):
         return
     if not hits:
         return
-    watch = set(stock_core.get_watchlist())
-    lines = ["📢 <b>บริษัทแจ้งผลประกอบการ (ข่าว SET)</b>", ""]
-    for h in hits:
-        star = "  ⭐ อยู่ในลิสต์" if h["symbol"] in watch else ""
-        lines.append(
-            f"• <b>{html.escape(h['symbol'])}</b> {h['datetime']:%H:%M} น. — "
-            f"{'/'.join(h['kinds'])}{star}"
-        )
-        if h.get("f45"):
-            lines.append(f"    {html.escape(h['f45'])}")
-    lines += [
-        "",
-        "บันทึกวันงบให้อัตโนมัติแล้ว — ดูปฏิกิริยาราคา: พิมพ์ชื่อหุ้น",
-        "ตัวที่ตอบรับดีจะติดสแกนรอบ 17:30 (หรือพิมพ์ <code>สแกน</code>)",
-    ]
-    text = "\n".join(lines)
+    text = build_news_alert_text(hits)
     for cid in chat_ids:
         try:
             await _send_long(context.bot, cid, text, parse_mode="HTML")
