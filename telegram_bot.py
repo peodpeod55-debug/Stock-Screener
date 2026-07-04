@@ -312,8 +312,88 @@ def _register_chat(chat_id: int):
 
 SCAN_HOUR, SCAN_MINUTE = 17, 30      # เวลาสแกนอัตโนมัติ (หลังตลาดปิด 16:30)
 REMIND_HOUR, REMIND_MINUTE = 8, 45   # เวลาเตือนวันงบตอนเช้า
+HEART_HOUR, HEART_MINUTE = 8, 30     # เวลาส่ง heartbeat เช้า
 MONITOR_INTERVAL_MIN = 15            # เช็คลิสต์ติดตามทุกกี่นาที (ช่วงตลาดเปิด)
 NEWS_POLL_MINUTES = 10               # เช็คข่าวแจ้งงบจากเว็บ SET ทุกกี่นาที
+
+
+# ── รู้ตัวว่าปิดไปนานแค่ไหน (ใช้ตัดสินใจเก็บตกข่าวตอนเปิด) ──────
+
+_ALIVE_PATH = os.path.join(_BASE_DIR, "last_alive.json")
+CATCHUP_MIN_GAP_HOURS = 20   # หายเกินกี่ชม. ถึงเริ่มเก็บตก (ข้ามหนึ่งช่วงเย็น)
+CATCHUP_MAX_DAYS = 7         # เก็บตกย้อนได้ลึกสุดกี่วัน
+
+
+def _write_alive():
+    try:
+        with open(_ALIVE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"ts": datetime.datetime.now(ZoneInfo("Asia/Bangkok")).isoformat()}, f)
+    except Exception:
+        pass
+
+
+def _read_alive():
+    try:
+        with open(_ALIVE_PATH, encoding="utf-8") as f:
+            return datetime.datetime.fromisoformat(json.load(f)["ts"])
+    except Exception:
+        return None
+
+
+def _catchup_days(last_alive, now):
+    """ควรเก็บตกข่าวย้อนกี่วัน — None ถ้าไม่ต้อง (เพิ่งปิดไปไม่นาน)"""
+    if last_alive is None:
+        return None  # เพิ่งใช้ครั้งแรก ไม่มีช่วงที่หายไป
+    gap_h = (now - last_alive).total_seconds() / 3600
+    if gap_h < CATCHUP_MIN_GAP_HOURS:
+        return None
+    return min(CATCHUP_MAX_DAYS, int(gap_h // 24) + 1)
+
+
+async def alive_job(context: ContextTypes.DEFAULT_TYPE):
+    _write_alive()
+
+
+async def startup_catchup_job(context: ContextTypes.DEFAULT_TYPE):
+    """รันครั้งเดียวตอนบอทเปิด: ถ้าหายไปนาน ให้ดึงข่าวย้อนช่วงที่หาย
+    มาบันทึกวันงบ/ตัวเลข F45 ให้ครบ (ข่าวเก่าบันทึกเงียบๆ ไม่สแปม)"""
+    now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
+    days = _catchup_days(_read_alive(), now)
+    _write_alive()
+    if days is None:
+        return
+    log.info("catch-up: fetching %d days of news after downtime", days)
+    try:
+        hits = await asyncio.to_thread(
+            set_news.check_new_earnings_news, 14, days)
+    except Exception:
+        log.exception("startup catch-up failed")
+        return
+    text = (f"🔄 บอทกลับมาทำงาน — เก็บตกข่าวแจ้งงบย้อน {days} วัน"
+            "ให้เรียบร้อยแล้ว (บันทึกวันงบ/ตัวเลข F45 ครบ)")
+    if hits:
+        text += "\n\n" + build_news_alert_text(hits)
+    for cid in _load_chat_ids():
+        try:
+            await _send_long(context.bot, cid, text, parse_mode="HTML")
+        except Exception:
+            pass
+
+
+async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
+    """ส่งสั้นๆ ทุกเช้าวันทำการว่ายังมีชีวิต — เช้าไหนไม่มีข้อความนี้
+    = บอทตายอยู่ ให้ไปเปิดใหม่"""
+    now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
+    if now.weekday() >= 5:
+        return
+    n_watch = len(stock_core.get_watchlist())
+    text = (f"✅ บอททำงานปกติ • ลิสต์ติดตาม {n_watch} ตัว • "
+            f"สแกนอัตโนมัติ {SCAN_HOUR:02d}:{SCAN_MINUTE:02d} น.")
+    for cid in _load_chat_ids():
+        try:
+            await context.bot.send_message(cid, text)
+        except Exception:
+            pass
 
 
 # ── เฝ้าข่าว "แจ้งผลประกอบการ" จากเว็บ SET ──────────────────────
@@ -896,6 +976,13 @@ def main():
         interval=NEWS_POLL_MINUTES * 60,
         first=120,
     )
+    app.job_queue.run_daily(
+        heartbeat_job,
+        time=datetime.time(HEART_HOUR, HEART_MINUTE, tzinfo=ZoneInfo("Asia/Bangkok")),
+    )
+    # จดเวลาว่ายังทำงานทุก 5 นาที + เก็บตกข่าวช่วงที่ปิดไป (ครั้งเดียวตอนเปิด)
+    app.job_queue.run_repeating(alive_job, interval=300, first=10)
+    app.job_queue.run_once(startup_catchup_job, when=20)
     app.run_polling(drop_pending_updates=True)
 
 

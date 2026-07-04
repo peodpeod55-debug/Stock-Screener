@@ -16,6 +16,7 @@ watch_state.json
 news_seen.json
 earnings_results.csv
 backtest_results.csv
+last_alive.json
 
 # ตั้งค่าเฉพาะเครื่อง
 .claude/

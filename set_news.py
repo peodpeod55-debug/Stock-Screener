@@ -386,15 +386,17 @@ def _save_seen(seen):
 
 # ── หน้าที่หลักสองแบบ ───────────────────────────────────────────
 
-def check_new_earnings_news(max_age_hours: float = 14):
+def check_new_earnings_news(max_age_hours: float = 14, days_back: int = 1):
     """สำหรับ job อัตโนมัติ: คืนเฉพาะข่าวงบ "ที่ยังไม่เคยเห็น"
     จัดกลุ่มต่อหุ้น [{symbol, datetime, kinds, headlines}]
 
     ทุกข่าวงบที่เจอ (ใหม่หรือเก่า) จะถูกบันทึกวันงบเข้าระบบเสมอ
     แต่แจ้งเตือนเฉพาะข่าวอายุไม่เกิน max_age_hours ชั่วโมง
     (กันสแปมย้อนหลังตอนเพิ่งเริ่มใช้ครั้งแรก)
+
+    days_back ปกติ 1 วัน — โหมดเก็บตกหลังบอทปิดนานส่งค่ามากกว่านั้น
     """
-    news = fetch_company_news(days_back=1)
+    news = fetch_company_news(days_back=days_back)
     seen = _load_seen()
     now = datetime.datetime.now(_BKK)
     by_symbol = {}
