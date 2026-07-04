@@ -243,6 +243,9 @@ def format_report(hits, scanned_count, html=True, limit=15, source_note=None,
         dsh = s.get("days_since_new_high")
         if dsh is not None and dsh <= 5:
             flags.append("ไฮใหม่วันนี้ 🔥" if dsh == 0 else f"ไฮใหม่ {dsh} วันก่อน")
+        streak = s.get("weekly_hh_streak") or 0
+        if streak >= 2:
+            flags.append(f"ไฮยกขึ้น {streak} สัปดาห์ติด 🔥")
         if s.get("above_pre_low") is False:
             flags.append("⛔ หลุด Low ก่อนงบ")
         vol_txt = f" วอล {r['vol_ratio']:.1f}x{volume_flag(r['vol_ratio'])}" if r["vol_ratio"] else ""

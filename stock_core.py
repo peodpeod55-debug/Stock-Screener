@@ -248,6 +248,36 @@ def _post_earnings_signals(hist, closes, price, last_earn):
     last_new_high_pos = int(is_new_high.values.nonzero()[0][-1])
     days_since_new_high = len(post_highs) - 1 - last_new_high_pos
 
+    # (2ข) ความถี่การทำไฮใหม่รายวัน — หุ้นที่ "ไปต่อเรื่อยๆ" ต้องทำ
+    # ไฮใหม่ถี่ ไม่ใช่พุ่งวันเดียวแล้วนิ่ง (ไม่นับวันแรกหลังงบ
+    # เพราะเป็นไฮใหม่ของช่วงโดยอัตโนมัติเสมอ)
+    later = is_new_high.iloc[1:]
+    new_high_days = int(later.sum())
+    post_days = len(later)
+    # ต้องมีข้อมูล ≥5 วันก่อนถึงเริ่มวัด — สัดส่วนช่วง 1-2 วันแรกไม่มีความหมาย
+    new_high_ratio = (new_high_days / post_days) if post_days >= 5 else None
+
+    # (2ค) ไฮรายสัปดาห์ยกสูงขึ้นต่อเนื่องกี่สัปดาห์ (นับถอยจากล่าสุด)
+    post_dates = dates[start:]
+    weekly_highs = []
+    cur_key = None
+    for d, h in zip(post_dates, post_highs):
+        key = d.isocalendar()[:2]  # (ปี, สัปดาห์ ISO)
+        if key != cur_key:
+            weekly_highs.append(float(h))
+            cur_key = key
+        elif float(h) > weekly_highs[-1]:
+            weekly_highs[-1] = float(h)
+    i = len(weekly_highs) - 1
+    # สัปดาห์ล่าสุดอาจยังไม่จบ — ถ้ายังไม่ผ่านไฮสัปดาห์ก่อน อย่าเพิ่ง
+    # ตัดสตรีค ให้ประเมินจากสัปดาห์ที่จบแล้วแทน
+    if i >= 1 and weekly_highs[i] <= weekly_highs[i - 1]:
+        i -= 1
+    weekly_hh_streak = 0
+    while i >= 1 and weekly_highs[i] > weekly_highs[i - 1]:
+        weekly_hh_streak += 1
+        i -= 1
+
     # (3) Low สุด 5 วันทำการก่อนวันงบ = แนวรับสำคัญ
     pre_earn_low = float(lows.iloc[start - 5:start].min())
     above_pre_low = price > pre_earn_low
@@ -258,22 +288,29 @@ def _post_earnings_signals(hist, closes, price, last_earn):
         "pre5d_high": pre5d_high,
         "broke_pre5d_high": broke_pre5d_high,
         "days_since_new_high": days_since_new_high,
+        "new_high_days": new_high_days,
+        "post_days": post_days,
+        "new_high_ratio": new_high_ratio,
+        "weekly_hh_streak": weekly_hh_streak,
+        "weeks_observed": len(weekly_highs),
         "pre_earn_low": pre_earn_low,
         "above_pre_low": above_pre_low,
         "pct_above_pre_low": _pct(pre_earn_low, price),
     }
 
 
-SCORE_MAX = 12
+SCORE_MAX = 15
 
 
 def signal_score(d):
-    """คะแนนสัญญาณหลังงบ 0-12 + ดาว
+    """คะแนนสัญญาณหลังงบ 0-15 + ดาว
 
-    น้ำหนักตามเกณฑ์ผู้ใช้: ทะลุไฮ 3 เดือนก่อนงบสำคัญสุด (3 คะแนน)
-    ผ่านไฮ 5 วันก่อนงบเป็นบันไดขั้นแรก (1 คะแนน — หุ้นทะลุไฮ 3 เดือน
-    จะได้ทั้งสองข้อรวม 4) ⭐⭐⭐ (10+) เป็นไปได้เฉพาะหุ้นที่ทะลุ
-    ไฮ 3 เดือนเท่านั้น (ไม่ทะลุได้สูงสุด 9)
+    น้ำหนักมากสุดคือ "ความต่อเนื่องของการปรับขึ้น" (รวม 6 คะแนน):
+    ไฮใหม่ยังสด + ทำไฮใหม่ถี่รายวัน + ไฮรายสัปดาห์ยกสูงขึ้นเรื่อยๆ
+    คะแนนกลุ่มนี้ต้อง "พิสูจน์" ด้วยเวลา (ความถี่เริ่มนับเมื่อมีข้อมูล
+    ≥5 วันหลังงบ, สตรีครายสัปดาห์ต้องข้ามสัปดาห์) — หุ้นเพิ่งออกงบ
+    วันแรกจึงได้สูงสุด 11 (⭐⭐) และ ⭐⭐⭐ (13+) เป็นไปได้เฉพาะ
+    หุ้นที่ทะลุไฮ 3 เดือน (3 คะแนน) และทำไฮต่อเนื่องจริงเท่านั้น
     """
     r = d.get("earn_reaction")
     s = d.get("post_signals")
@@ -292,17 +329,29 @@ def signal_score(d):
         pts += 1
     if s["broke_pre3m_high"]:
         pts += 3
+    # ── ความต่อเนื่องของการปรับขึ้น (รวม 6) ──
     if s["days_since_new_high"] <= 1:
-        pts += 3
-    elif s["days_since_new_high"] <= 5:
         pts += 2
+    elif s["days_since_new_high"] <= 5:
+        pts += 1
+    ratio = s.get("new_high_ratio")
+    if ratio is not None:
+        if ratio >= 0.5:
+            pts += 2
+        elif ratio >= 0.3:
+            pts += 1
+    streak = s.get("weekly_hh_streak") or 0
+    if streak >= 2:
+        pts += 2
+    elif streak == 1:
+        pts += 1
     if s["above_pre_low"]:
         pts += 1
-    if pts >= 10:
+    if pts >= 13:
         stars = "⭐⭐⭐"
-    elif pts >= 7:
+    elif pts >= 9:
         stars = "⭐⭐"
-    elif pts >= 4:
+    elif pts >= 5:
         stars = "⭐"
     else:
         stars = ""

@@ -74,6 +74,12 @@ def lookup(ticker_input):
         print(f"  ไฮ 3 ด.ก่อนงบ  :  {s['pre3m_high']:>10.2f}   {hi_status}")
         dsh = s["days_since_new_high"]
         print(f"  ไฮใหม่ล่าสุด   :  {'วันนี้ 🔥' if dsh == 0 else str(dsh) + ' วันทำการก่อน'}")
+        if s.get("new_high_ratio") is not None:
+            print(f"  ความถี่ไฮใหม่  :  {s['new_high_days']}/{s['post_days']} วันหลังงบ ({s['new_high_ratio'] * 100:.0f}%)")
+        if (s.get("weeks_observed") or 0) >= 2:
+            streak = s.get("weekly_hh_streak") or 0
+            streak_txt = f"ยกขึ้น {streak} สัปดาห์ติด{' 🔥' if streak >= 2 else ''}" if streak else "สัปดาห์นี้ยังไม่ยกขึ้น"
+            print(f"  ไฮรายสัปดาห์   :  {streak_txt}")
         low_status = "✅ ยังเหนือ" if s["above_pre_low"] else "⛔ หลุดแล้ว"
         print(f"  Low ก่อนงบ     :  {s['pre_earn_low']:>10.2f}   {low_status} ({format_signed_pct(s['pct_above_pre_low'])})")
     print(f"  {bar}")

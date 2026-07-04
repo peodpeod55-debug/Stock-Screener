@@ -198,6 +198,16 @@ def build_message(ticker_input: str) -> str:
         dsh = s["days_since_new_high"]
         dsh_txt = "วันนี้ 🔥" if dsh == 0 else f"{dsh} วันทำการก่อน"
         lines.append(f"• ไฮใหม่ล่าสุด   : {dsh_txt}")
+        if s.get("new_high_ratio") is not None:
+            lines.append(
+                f"• ความถี่ไฮใหม่  : {s['new_high_days']}/{s['post_days']} "
+                f"วันหลังงบ ({s['new_high_ratio'] * 100:.0f}%)"
+            )
+        if (s.get("weeks_observed") or 0) >= 2:
+            streak = s.get("weekly_hh_streak") or 0
+            streak_txt = (f"ยกขึ้น {streak} สัปดาห์ติด{' 🔥' if streak >= 2 else ''}"
+                          if streak else "สัปดาห์นี้ยังไม่ยกขึ้น")
+            lines.append(f"• ไฮรายสัปดาห์  : {streak_txt}")
         low_status = "✅ ยังเหนือ" if s["above_pre_low"] else "⛔ หลุดแล้ว"
         lines.append(
             f"• Low ก่อนงบ     : <code>{s['pre_earn_low']:.2f}</code>  "
@@ -707,6 +717,9 @@ def build_watchlist_summary() -> str:
                 flags.append("ไฮใหม่วันนี้ 🔥")
             elif s["days_since_new_high"] <= 5:
                 flags.append(f"ไฮใหม่ {s['days_since_new_high']} วันก่อน")
+            streak = s.get("weekly_hh_streak") or 0
+            if streak >= 2:
+                flags.append(f"ไฮยกขึ้น {streak} สัปดาห์ติด 🔥")
             if not s["above_pre_low"]:
                 flags.append("⛔ หลุด Low ก่อนงบ")
         since_txt = ""
