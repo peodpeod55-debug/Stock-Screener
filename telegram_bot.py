@@ -22,6 +22,7 @@ from telegram.ext import (
 
 import stats
 import scanner
+import set_news
 import stock_core
 from stock_core import (
     format_pct,
@@ -257,6 +258,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• บอทเช็คลิสต์ให้เองช่วงตลาดเปิด แจ้งทันทีเมื่อ\n"
         "  ทะลุไฮ 3 ด. / ผ่านไฮ 5 วัน / ทำไฮใหม่ / ⛔ หลุด Low ก่อนงบ\n"
         "• เตือนตอนเช้าถ้าหุ้นในลิสต์งบออกวันนี้/พรุ่งนี้\n\n"
+        "<b>ข่าวแจ้งงบจากเว็บ SET</b>\n"
+        "• <code>ข่าวงบ</code> — ใครแจ้งผลประกอบการแล้วบ้าง (2 วันล่าสุด)\n"
+        "• บอทเฝ้าข่าวให้เองทุก 10 นาที ช่วงเช้า/หลังปิดตลาด\n"
+        "  เจอบริษัทแจ้งงบ → เตือนทันที + บันทึกวันงบอัตโนมัติ\n\n"
         "<b>สแกนหุ้นตอบรับงบดี</b>\n"
         "• <code>สแกน</code> — สแกนทั้งกระดานเดี๋ยวนี้ (~1-3 นาที)\n"
         "• อัตโนมัติทุกวันทำการ 17:30 น. บอทส่งผลให้เอง\n"
@@ -297,6 +302,70 @@ def _register_chat(chat_id: int):
 SCAN_HOUR, SCAN_MINUTE = 17, 30      # เวลาสแกนอัตโนมัติ (หลังตลาดปิด 16:30)
 REMIND_HOUR, REMIND_MINUTE = 8, 45   # เวลาเตือนวันงบตอนเช้า
 MONITOR_INTERVAL_MIN = 15            # เช็คลิสต์ติดตามทุกกี่นาที (ช่วงตลาดเปิด)
+NEWS_POLL_MINUTES = 10               # เช็คข่าวแจ้งงบจากเว็บ SET ทุกกี่นาที
+
+
+# ── เฝ้าข่าว "แจ้งผลประกอบการ" จากเว็บ SET ──────────────────────
+# บริษัทส่วนใหญ่ยื่นงบหลังปิดตลาด (~17:00-21:30) หรือเช้าก่อนเปิด
+# → poll เฉพาะสองช่วงนั้นพอ นอกช่วง = ไม่เปิดเบราว์เซอร์ให้เปลืองเครื่อง
+
+def _in_news_window(t: datetime.time) -> bool:
+    return (datetime.time(7, 0) <= t <= datetime.time(9, 45)
+            or datetime.time(17, 0) <= t <= datetime.time(21, 45))
+
+
+async def news_monitor_job(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
+    if now.weekday() >= 5 or _is_market_holiday(now.date()):
+        return
+    if not _in_news_window(now.time()):
+        return
+    chat_ids = _load_chat_ids()
+    if not chat_ids:
+        return
+    try:
+        hits = await asyncio.to_thread(set_news.check_new_earnings_news)
+    except Exception:
+        log.exception("SET news poll failed")
+        return
+    if not hits:
+        return
+    watch = set(stock_core.get_watchlist())
+    lines = ["📢 <b>บริษัทแจ้งผลประกอบการ (ข่าว SET)</b>", ""]
+    for h in hits:
+        star = "  ⭐ อยู่ในลิสต์" if h["symbol"] in watch else ""
+        lines.append(
+            f"• <b>{html.escape(h['symbol'])}</b> {h['datetime']:%H:%M} น. — "
+            f"{'/'.join(h['kinds'])}{star}"
+        )
+    lines += [
+        "",
+        "บันทึกวันงบให้อัตโนมัติแล้ว — ดูปฏิกิริยาราคา: พิมพ์ชื่อหุ้น",
+        "ตัวที่ตอบรับดีจะติดสแกนรอบ 17:30 (หรือพิมพ์ <code>สแกน</code>)",
+    ]
+    text = "\n".join(lines)
+    for cid in chat_ids:
+        try:
+            await _send_long(context.bot, cid, text, parse_mode="HTML")
+        except Exception:
+            log.exception("send news alert failed (chat %s)", cid)
+
+
+def build_earnings_news_summary() -> str:
+    """คำสั่ง "ข่าวงบ": ใครแจ้งผลประกอบการแล้วบ้างใน 2 วันล่าสุด"""
+    rows = set_news.list_earnings_news(days_back=2)
+    if not rows:
+        return "📢 ไม่พบบริษัทแจ้งผลประกอบการใน 2 วันล่าสุด (ข่าวจากเว็บ SET)"
+    watch = set(stock_core.get_watchlist())
+    lines = ["📢 <b>บริษัทแจ้งผลประกอบการล่าสุด</b> (ข่าว SET ย้อน 2 วัน)", ""]
+    for r in rows:
+        star = "  ⭐" if r["symbol"] in watch else ""
+        lines.append(
+            f"• {r['datetime']:%d/%m %H:%M}  <b>{html.escape(r['symbol'])}</b> — "
+            f"{'/'.join(r['kinds'])}{star}"
+        )
+    lines += ["", "บันทึกวันงบเข้าระบบให้แล้ว — ดูปฏิกิริยาราคา: พิมพ์ชื่อหุ้น"]
+    return "\n".join(lines)
 
 
 # ── แจ้งเตือนเมื่อสถานะหุ้นในลิสต์เปลี่ยน (เช็คช่วงตลาดเปิด) ────
@@ -668,6 +737,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ข่าวแจ้งงบจากเว็บ SET: "ข่าวงบ"
+    if len(tickers) == 1 and tickers[0].lower() in ("ข่าวงบ", "news"):
+        await update.message.reply_text(
+            "⏳ กำลังเช็คข่าวจากเว็บ SET (~20-30 วินาที)..."
+        )
+        result = await asyncio.to_thread(build_earnings_news_summary)
+        await _reply_long(update.message, result, parse_mode="HTML")
+        return
+
     # สถิติย้อนหลังจาก scan_log.csv: "สถิติ"
     if len(tickers) == 1 and tickers[0].lower() in ("สถิติ", "stats"):
         await update.message.reply_text(
@@ -747,7 +825,9 @@ def main():
     print("  Bot กำลังทำงาน... (Ctrl+C เพื่อหยุด)")
     print(f"  สแกนอัตโนมัติทุกวันทำการ เวลา {SCAN_HOUR:02d}:{SCAN_MINUTE:02d} น.")
     print(f"  เตือนวันงบทุกวันทำการ เวลา {REMIND_HOUR:02d}:{REMIND_MINUTE:02d} น.")
-    print(f"  เช็คลิสต์ติดตามทุก {MONITOR_INTERVAL_MIN} นาที ช่วงตลาดเปิด\n")
+    print(f"  เช็คลิสต์ติดตามทุก {MONITOR_INTERVAL_MIN} นาที ช่วงตลาดเปิด")
+    print(f"  เฝ้าข่าวแจ้งงบ (เว็บ SET) ทุก {NEWS_POLL_MINUTES} นาที "
+          "ช่วง 07:00-09:45 และ 17:00-21:45\n")
     log.info("bot starting")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -766,6 +846,11 @@ def main():
         watchlist_monitor_job,
         interval=MONITOR_INTERVAL_MIN * 60,
         first=60,
+    )
+    app.job_queue.run_repeating(
+        news_monitor_job,
+        interval=NEWS_POLL_MINUTES * 60,
+        first=120,
     )
     app.run_polling(drop_pending_updates=True)
 

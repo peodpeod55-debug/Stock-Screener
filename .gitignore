@@ -13,6 +13,7 @@ lookup_log.csv
 chat_ids.json
 watchlist.json
 watch_state.json
+news_seen.json
 
 # ตั้งค่าเฉพาะเครื่อง
 .claude/
