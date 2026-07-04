@@ -261,7 +261,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>ข่าวแจ้งงบจากเว็บ SET</b>\n"
         "• <code>ข่าวงบ</code> — ใครแจ้งผลประกอบการแล้วบ้าง (2 วันล่าสุด)\n"
         "• บอทเฝ้าข่าวให้เองทุก 10 นาที ช่วงเช้า/หลังปิดตลาด\n"
-        "  เจอบริษัทแจ้งงบ → เตือนทันที + บันทึกวันงบอัตโนมัติ\n\n"
+        "  เจอบริษัทแจ้งงบ → เตือนทันที + บันทึกวันงบอัตโนมัติ\n"
+        "  พร้อมตัวเลขจาก F45 เช่น กำไร 120.5 ลบ. (+45% YoY)\n\n"
         "<b>สแกนหุ้นตอบรับงบดี</b>\n"
         "• <code>สแกน</code> — สแกนทั้งกระดานเดี๋ยวนี้ (~1-3 นาที)\n"
         "• อัตโนมัติทุกวันทำการ 17:30 น. บอทส่งผลให้เอง\n"
@@ -338,6 +339,8 @@ async def news_monitor_job(context: ContextTypes.DEFAULT_TYPE):
             f"• <b>{html.escape(h['symbol'])}</b> {h['datetime']:%H:%M} น. — "
             f"{'/'.join(h['kinds'])}{star}"
         )
+        if h.get("f45"):
+            lines.append(f"    {html.escape(h['f45'])}")
     lines += [
         "",
         "บันทึกวันงบให้อัตโนมัติแล้ว — ดูปฏิกิริยาราคา: พิมพ์ชื่อหุ้น",
@@ -364,6 +367,8 @@ def build_earnings_news_summary() -> str:
             f"• {r['datetime']:%d/%m %H:%M}  <b>{html.escape(r['symbol'])}</b> — "
             f"{'/'.join(r['kinds'])}{star}"
         )
+        if r.get("f45"):
+            lines.append(f"    {html.escape(r['f45'])}")
     lines += ["", "บันทึกวันงบเข้าระบบให้แล้ว — ดูปฏิกิริยาราคา: พิมพ์ชื่อหุ้น"]
     return "\n".join(lines)
 
@@ -740,7 +745,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ข่าวแจ้งงบจากเว็บ SET: "ข่าวงบ"
     if len(tickers) == 1 and tickers[0].lower() in ("ข่าวงบ", "news"):
         await update.message.reply_text(
-            "⏳ กำลังเช็คข่าวจากเว็บ SET (~20-30 วินาที)..."
+            "⏳ กำลังเช็คข่าวจากเว็บ SET (~1 นาที ถ้ามี F45 ให้อ่านตัวเลข)..."
         )
         result = await asyncio.to_thread(build_earnings_news_summary)
         await _reply_long(update.message, result, parse_mode="HTML")

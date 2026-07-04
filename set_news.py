@@ -12,6 +12,7 @@
 รันเองได้: python set_news.py   (ดูรายชื่อบริษัทที่แจ้งงบใน 1-2 วันล่าสุด)
 """
 import os
+import re
 import json
 import datetime
 import threading
@@ -118,6 +119,159 @@ def fetch_company_news(days_back: int = 1, timeout_s: int = 90):
     return out
 
 
+# ── ดึงเนื้อหาข่าวรายตัว (ใช้อ่านแบบ F45) ───────────────────────
+
+F45_DETAIL_MAX = 15  # อ่านรายละเอียด F45 สูงสุดกี่ฉบับต่อรอบ (กันวันพีคใช้เวลานานเกิน)
+
+
+def fetch_news_details(urls, timeout_s: int = 90):
+    """เปิดหน้ารายละเอียดข่าวทีละ URL ในเบราว์เซอร์เดียว คืน {url: ข้อความในหน้า}
+
+    เข้าหน้า detail ตรงๆ จะได้ "ไม่มีข้อมูล" — ต้องแวะหน้า list ก่อน
+    ให้ session ผ่านระบบกันบอท แล้วค่อยไล่เปิดทีละหน้า
+    URL ไหนเปิดไม่สำเร็จจะไม่อยู่ในผลลัพธ์ (ผู้เรียกต้องเช็คเอง)
+    """
+    from playwright.sync_api import sync_playwright
+
+    out = {}
+    if not urls:
+        return out
+    with _FETCH_LOCK:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            try:
+                ctx = browser.new_context(
+                    locale="th-TH",
+                    timezone_id="Asia/Bangkok",
+                    viewport={"width": 1366, "height": 900},
+                    service_workers="block",
+                )
+                page = ctx.new_page()
+                with page.expect_response(
+                    lambda r: _API_PATH in r.url and r.status == 200,
+                    timeout=timeout_s * 1000,
+                ):
+                    page.goto(NEWS_PAGE, wait_until="domcontentloaded",
+                              timeout=timeout_s * 1000)
+                for u in urls:
+                    try:
+                        page.goto(u, wait_until="domcontentloaded",
+                                  timeout=timeout_s * 1000)
+                        # รอจนเนื้อข่าวโหลด (แบบ F45 มีคำว่า "กำไร" เสมอ)
+                        page.wait_for_function(
+                            "document.body && document.body.innerText.includes('กำไร')",
+                            timeout=20000,
+                        )
+                        out[u] = page.inner_text("body")
+                    except Exception:
+                        continue
+            finally:
+                browser.close()
+    return out
+
+
+# ── แกะตัวเลขจากแบบสรุปผลการดำเนินงาน (F45) ─────────────────────
+
+def _extract_numbers(line: str):
+    """ตัวเลขบนบรรทัด F45 — วงเล็บ = ค่าติดลบ, ข้าม "(แก้ไข)" ที่ไม่มีตัวเลข"""
+    out = []
+    for tok in re.findall(r"\(?\d[\d,]*(?:\.\d+)?\)?", line):
+        neg = tok.startswith("(") or tok.endswith(")")
+        try:
+            val = float(tok.strip("()").replace(",", ""))
+        except ValueError:
+            continue
+        out.append(-val if neg else val)
+    return out
+
+
+def parse_f45(text: str):
+    """อ่านแบบสรุปผลการดำเนินงาน (F45) จากข้อความหน้าเว็บ
+
+    คืน {"period", "year", "profit_cur", "profit_prior"} (กำไรหน่วย: บาท)
+    หรือ None ถ้าอ่านไม่ได้ — เค้าโครง F45 เป็นมาตรฐานเดียวกันทุกบริษัท:
+    บรรทัด "กำไร (ขาดทุน)" แรกคือกำไรสุทธิ [ปีนี้ ปีก่อน ...]
+    (แบบราย 6/9 เดือนมี 4 คอลัมน์ — สองตัวแรกคือไตรมาสล่าสุดเสมอ)
+    """
+    if "F45" not in text:
+        return None
+    unit = 1000.0 if re.search(r"หน่วย\s*:\s*พันบาท", text) else 1.0
+
+    m = re.search(r"ไตรมาสที่\s*(\d)", text)
+    if m:
+        period = f"Q{m.group(1)}"
+    elif re.search(r"งวด\s*1\s*ปี|ประจำปี", text):
+        period = "งบปี"
+    else:
+        m6 = re.search(r"งวด\s*(\d+)\s*เดือน", text)
+        period = f"งวด {m6.group(1)} ด." if m6 else ""
+
+    year = None
+    ym = re.search(r"^ปี\s+(\d{4})\s+(\d{4})", text, re.M)
+    if ym:
+        year = ym.group(1)
+
+    for line in text.splitlines():
+        if "กำไร" not in line or "ต่อหุ้น" in line:
+            continue
+        nums = _extract_numbers(line)
+        if len(nums) >= 2:
+            return {
+                "period": period,
+                "year": year,
+                "profit_cur": nums[0] * unit,
+                "profit_prior": nums[1] * unit,
+            }
+    return None
+
+
+def format_f45_summary(f45) -> str:
+    """สรุปสั้นๆ เช่น "Q1/2569: กำไร 120.5 ลบ. (+45% YoY)" """
+    cur, prior = f45["profit_cur"], f45["profit_prior"]
+    cur_mb, prior_mb = cur / 1e6, prior / 1e6
+    label = f45["period"] or "งวดล่าสุด"
+    if f45["year"]:
+        label += f"/{f45['year']}"
+
+    if cur >= 0 and prior > 0:
+        pct = (cur - prior) / prior * 100
+        body = f"กำไร {cur_mb:,.1f} ลบ. ({pct:+.0f}% YoY)"
+    elif cur >= 0 and prior <= 0:
+        body = (f"พลิกเป็นกำไร {cur_mb:,.1f} ลบ. "
+                f"(ปีก่อนขาดทุน {abs(prior_mb):,.1f} ลบ.)")
+    elif cur < 0 and prior >= 0:
+        body = f"พลิกเป็นขาดทุน {abs(cur_mb):,.1f} ลบ."
+    else:
+        pct = (abs(cur) - abs(prior)) / abs(prior) * 100 if prior else None
+        trend = ""
+        if pct is not None:
+            trend = (f" (ขาดทุนเพิ่ม {pct:.0f}%)" if pct > 0
+                     else f" (ขาดทุนลด {abs(pct):.0f}%)")
+        body = f"ขาดทุน {abs(cur_mb):,.1f} ลบ.{trend}"
+    return f"{label}: {body}"
+
+
+def _attach_f45_summaries(by_symbol):
+    """เติมสรุปตัวเลข F45 ("f45" key) ให้หุ้นที่มีข่าว F45 ใน dict ผลลัพธ์"""
+    targets = {sym: e["f45_url"] for sym, e in by_symbol.items() if e.get("f45_url")}
+    if not targets:
+        return
+    # ตัดจำนวนเมื่อวันพีค — เรียงตามเวลาข่าวใหม่สุดก่อน
+    ordered = sorted(targets, key=lambda s: by_symbol[s]["datetime"], reverse=True)
+    urls = [targets[s] for s in ordered[:F45_DETAIL_MAX]]
+    try:
+        details = fetch_news_details(urls)
+    except Exception:
+        return  # อ่านรายละเอียดไม่ได้ ไม่เป็นไร — แจ้งเตือนแบบไม่มีตัวเลขแทน
+    for sym in ordered[:F45_DETAIL_MAX]:
+        text = details.get(targets[sym])
+        if not text:
+            continue
+        parsed = parse_f45(text)
+        if parsed:
+            by_symbol[sym]["f45"] = format_f45_summary(parsed)
+
+
 # ── แยกประเภทข่าว "งบออกแล้ว" ───────────────────────────────────
 
 def classify_earnings_news(headline: str):
@@ -188,9 +342,14 @@ def check_new_earnings_news(max_age_hours: float = 14):
         if kind not in entry["kinds"]:
             entry["kinds"].append(kind)
         entry["headlines"].append(it["headline"])
+        # บางบริษัทยื่น F45 หลายฉบับพร้อมกัน (เช่นแก้ไขงวดเก่า + งวดล่าสุด)
+        # ลูปไล่จากข่าวใหม่ → เก่า จึงเก็บเฉพาะฉบับแรกที่เจอ (= ใหม่สุด)
+        if kind == "F45" and "f45_url" not in entry:
+            entry["f45_url"] = it["url"]
         if it["datetime"] > entry["datetime"]:
             entry["datetime"] = it["datetime"]
     _save_seen(seen)
+    _attach_f45_summaries(by_symbol)
     return sorted(by_symbol.values(), key=lambda x: x["datetime"], reverse=True)
 
 
@@ -211,8 +370,11 @@ def list_earnings_news(days_back: int = 1):
         })
         if kind not in entry["kinds"]:
             entry["kinds"].append(kind)
+        if kind == "F45" and "f45_url" not in entry:
+            entry["f45_url"] = it["url"]
         if it["datetime"] > entry["datetime"]:
             entry["datetime"] = it["datetime"]
+    _attach_f45_summaries(by_symbol)
     return sorted(by_symbol.values(), key=lambda x: x["datetime"], reverse=True)
 
 
@@ -223,4 +385,6 @@ if __name__ == "__main__":
         print("ไม่พบบริษัทแจ้งผลประกอบการใน 2 วันล่าสุด")
     for r in rows:
         print(f"  {r['datetime']:%d/%m %H:%M}  {r['symbol']:<10} {'/'.join(r['kinds'])}")
+        if r.get("f45"):
+            print(f"  {'':<18}{r['f45']}")
     print(f"\nรวม {len(rows)} บริษัท (บันทึกวันงบเข้าระบบแล้ว)\n")
