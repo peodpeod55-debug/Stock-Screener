@@ -1,0 +1,18 @@
+# ความลับ — ห้ามเข้า git เด็ดขาด
+.env
+
+# cache / ไฟล์ที่โปรแกรมสร้างเอง
+.yf_cache/
+__pycache__/
+*.pyc
+
+# ข้อมูลสะสมส่วนตัว (log, ลิสต์, สถานะ)
+bot_log.txt*
+scan_log.csv
+lookup_log.csv
+chat_ids.json
+watchlist.json
+watch_state.json
+
+# ตั้งค่าเฉพาะเครื่อง
+.claude/
