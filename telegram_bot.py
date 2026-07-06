@@ -534,7 +534,8 @@ def build_morning_digest(since_dt: datetime.datetime, now: datetime.datetime = N
 
     since_dt: จุดเริ่ม window (ดู _digest_window_start / คำสั่ง "สรุปงบ N")
     window_label: ข้อความอธิบายช่วงเวลาในหัวเรื่อง (None = ใช้แบบ "ตั้งแต่เย็นวาน")
-    คืน "" ถ้าไม่มีบริษัทแจ้งงบเลยในช่วงนั้น (ผู้เรียกตัดสินใจเองว่าจะพิมพ์อะไร)
+    คืน (ข้อความ, รายชื่อตัวโตแรงที่ยังไม่อยู่ในลิสต์ — ไว้ทำปุ่ม ➕ ติดตาม)
+    หรือ ("", []) ถ้าไม่มีบริษัทแจ้งงบเลยในช่วงนั้น (ผู้เรียกตัดสินใจเองว่าจะพิมพ์อะไร)
     """
     if now is None:
         now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
@@ -585,7 +586,10 @@ def build_morning_digest(since_dt: datetime.datetime, now: datetime.datetime = N
 
     total_symbols = len(set(latest_result) | set(filings))
     if total_symbols == 0:
-        return ""
+        return "", []
+
+    # ตัวโตแรงที่ยังไม่ได้เฝ้า — เรียงตามลำดับที่แสดง ไว้ให้ผู้เรียกทำปุ่ม ➕
+    hot = [r["symbol"] for r in strong_in + strong_out if r["symbol"] not in watch]
 
     idx = 0
 
@@ -628,9 +632,12 @@ def build_morning_digest(since_dt: datetime.datetime, now: datetime.datetime = N
         lines.append(shown)
         lines.append("")
 
-    lines.append("ดูปฏิกิริยาราคา: พิมพ์ชื่อหุ้น • เฝ้าตัวไหน: <code>ติดตาม XXX</code>")
+    if hot:
+        lines.append("เฝ้าตัวไหน: กดปุ่ม ➕ ด้านล่าง • ดูปฏิกิริยาราคา: พิมพ์ชื่อหุ้น")
+    else:
+        lines.append("ดูปฏิกิริยาราคา: พิมพ์ชื่อหุ้น • เฝ้าตัวไหน: <code>ติดตาม XXX</code>")
     lines.append("ตัวที่ตอบรับดีจะติดสแกนรอบ 17:30 วันนี้")
-    return "\n".join(lines)
+    return "\n".join(lines), hot
 
 
 # สอง job (08:55 กับตอนเปิดบอท) อาจตกวันเดียวกัน — เช็ค last_sent ทั้งคู่
@@ -655,15 +662,17 @@ async def _run_morning_digest(context: ContextTypes.DEFAULT_TYPE, label: str):
     try:
         since_dt = _digest_window_start(now)
         try:
-            text = await asyncio.to_thread(build_morning_digest, since_dt, now)
+            text, hot = await asyncio.to_thread(build_morning_digest, since_dt, now)
         except Exception:
             log.exception("%s failed", label)
             return
         if not text:
             return
+        buttons = _watch_buttons(hot)
         for cid in chat_ids:
             try:
-                await _send_long(context.bot, cid, text, parse_mode="HTML")
+                await _send_long(context.bot, cid, text,
+                                 reply_markup=buttons, parse_mode="HTML")
             except Exception:
                 log.exception("send %s failed (chat %s)", label, cid)
         state = _load_digest_state()
@@ -834,14 +843,15 @@ async def earnings_reminder_job(context: ContextTypes.DEFAULT_TYPE):
             log.exception("send reminder failed (chat %s)", cid)
 
 
-# ── ปุ่ม "➕ ติดตาม" ใต้ผลสแกน (กดแล้วเข้าลิสต์ทันที) ────────────
+# ── ปุ่ม "➕ ติดตาม" ใต้ผลสแกน/สรุปงบ (กดแล้วเข้าลิสต์ทันที) ─────
+# รับได้ทั้ง dict ผลสแกน ({"ticker": ...}) และชื่อหุ้นเปล่าๆ (จากสรุปงบ)
 
 def _watch_buttons(hits, limit=15):
     if not hits:
         return None
     rows, row = [], []
     for d in hits[:limit]:
-        base = d["ticker"].replace(".BK", "")
+        base = (d["ticker"] if isinstance(d, dict) else d).replace(".BK", "")
         row.append(InlineKeyboardButton(f"➕ {base}", callback_data=f"watch:{base}"))
         if len(row) == 3:
             rows.append(row)
@@ -1080,13 +1090,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             since_dt = _digest_window_start(now)
             window_label = None
-        result = build_morning_digest(since_dt, now, window_label=window_label)
+        result, hot = build_morning_digest(since_dt, now, window_label=window_label)
         if not result:
             await update.message.reply_text(
                 f"📭 ไม่มีบริษัทแจ้งงบตั้งแต่ {since_dt:%d/%m %H:%M} น. ครับ"
             )
             return
-        await _reply_long(update.message, result, parse_mode="HTML")
+        await _reply_long(update.message, result,
+                          reply_markup=_watch_buttons(hot), parse_mode="HTML")
         return
 
     # สถิติย้อนหลังจาก scan_log.csv: "สถิติ"
