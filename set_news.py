@@ -341,8 +341,8 @@ def _attach_f45_summaries(by_symbol):
     if not targets:
         return
     # จัดคิวเมื่อวันพีคเกินโควตา: หุ้นในลิสต์ติดตาม/universe ได้อ่านก่อน
-    # ที่เหลือเรียงตามเวลาข่าวใหม่สุด
-    watch = set(stock_core.get_watchlist())
+    # ที่เหลือเรียงตามเวลาข่าวใหม่สุด (union ทุกคน — เป็นแค่ลำดับความสำคัญ)
+    watch = set(stock_core.get_all_watched_symbols())
     uni = set(scanner.load_universe())
     ordered = sorted(
         targets,
