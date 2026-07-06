@@ -865,7 +865,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     data = q.data or ""
     if data.startswith("watch:"):
-        base, symbols = stock_core.add_to_watchlist(data.split(":", 1)[1])
+        base, symbols = stock_core.add_to_watchlist(
+            data.split(":", 1)[1], update.effective_chat.id
+        )
         await q.answer(f"เพิ่ม {base} เข้าลิสต์แล้ว ({len(symbols)} ตัว)")
         try:
             await q.message.reply_text(
@@ -979,9 +981,9 @@ def handle_earnings_command(tokens) -> str:
     return "\n".join(lines)
 
 
-def build_watchlist_summary() -> str:
+def build_watchlist_summary(chat_id) -> str:
     """สรุปหุ้นที่ติดตาม เรียงตามแรงตอบรับวันงบ (มาก → น้อย)"""
-    symbols = stock_core.get_watchlist()
+    symbols = stock_core.get_watchlist(chat_id)
     if not symbols:
         return (
             "📋 ยังไม่มีหุ้นในลิสต์\n"
@@ -1122,7 +1124,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         added = []
         for t in tickers[1:]:
-            base, _ = stock_core.add_to_watchlist(t)
+            base, _ = stock_core.add_to_watchlist(t, update.effective_chat.id)
             added.append(base)
         await update.message.reply_text(
             f"✅ เพิ่มเข้าลิสต์แล้ว: <b>{html.escape(' '.join(added))}</b>\n"
@@ -1135,7 +1137,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(tickers) < 2:
             await update.message.reply_text("พิมพ์ <code>เลิกติดตาม AOT</code>", parse_mode="HTML")
             return
-        removed, remaining = stock_core.remove_from_watchlist(tickers[1])
+        removed, remaining = stock_core.remove_from_watchlist(
+            tickers[1], update.effective_chat.id
+        )
         if removed:
             await update.message.reply_text(
                 f"🗑 เอา <b>{html.escape(removed)}</b> ออกจากลิสต์แล้ว (เหลือ {len(remaining)} ตัว)",
@@ -1147,7 +1151,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if len(tickers) == 1 and tickers[0].lower() in ("ลิสต์", "list", "watchlist"):
         await update.message.reply_text("⏳ กำลังสรุปลิสต์...")
-        result = await asyncio.to_thread(build_watchlist_summary)
+        result = await asyncio.to_thread(
+            build_watchlist_summary, update.effective_chat.id
+        )
         await _reply_long(update.message, result, parse_mode="HTML")
         return
 
