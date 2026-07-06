@@ -390,10 +390,10 @@ async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
     if now.weekday() >= 5:
         return
-    n_watch = len(stock_core.get_watchlist())
-    text = (f"✅ บอททำงานปกติ • ลิสต์ติดตาม {n_watch} ตัว • "
-            f"สแกนอัตโนมัติ {SCAN_HOUR:02d}:{SCAN_MINUTE:02d} น.")
     for cid in _load_chat_ids():
+        n_watch = len(stock_core.get_watchlist(cid))
+        text = (f"✅ บอททำงานปกติ • ลิสต์ติดตาม {n_watch} ตัว • "
+                f"สแกนอัตโนมัติ {SCAN_HOUR:02d}:{SCAN_MINUTE:02d} น.")
         try:
             await context.bot.send_message(cid, text)
         except Exception:
@@ -413,7 +413,7 @@ def build_news_alert_text(hits) -> str:
     """ประกอบข้อความแจ้งเตือนข่าวงบ — คืนพีคมีบริษัทยื่นเป็นร้อย
     จึงแสดงเต็มเฉพาะ "ตัวเด่น" (อยู่ในลิสต์/universe หรืองบโตแรง 🔥)
     ที่เหลือรวบเป็นสรุปย่อท้ายข้อความ กันแจ้งเตือนท่วม"""
-    watch = set(stock_core.get_watchlist())
+    watch = set(stock_core.get_all_watched_symbols())  # union: มีคนติดตามอยู่
     uni = set(scanner.load_universe())
     top, rest = [], []
     for h in hits:
@@ -479,7 +479,7 @@ def build_earnings_news_summary() -> str:
     rows = set_news.list_earnings_news(days_back=2)
     if not rows:
         return "📢 ไม่พบบริษัทแจ้งผลประกอบการใน 2 วันล่าสุด (ข่าวจากเว็บ SET)"
-    watch = set(stock_core.get_watchlist())
+    watch = set(stock_core.get_all_watched_symbols())  # union: มีคนติดตามอยู่
     lines = ["📢 <b>บริษัทแจ้งผลประกอบการล่าสุด</b> (ข่าว SET ย้อน 2 วัน)", ""]
     for r in rows:
         star = "  ⭐" if r["symbol"] in watch else ""
@@ -550,7 +550,7 @@ def build_morning_digest(since_dt: datetime.datetime, now: datetime.datetime = N
         if cur is None or r["news_datetime"] > cur["news_datetime"]:
             latest_result[r["symbol"]] = r
 
-    watch = set(stock_core.get_watchlist())
+    watch = set(stock_core.get_all_watched_symbols())  # union: มีคนติดตามอยู่
     uni = set(scanner.load_universe())
 
     strong_in, strong_out, weak = [], [], []
@@ -813,9 +813,9 @@ async def watchlist_monitor_job(context: ContextTypes.DEFAULT_TYPE):
 
 # ── เตือนตอนเช้า: หุ้นในลิสต์ตัวไหนงบออกวันนี้/พรุ่งนี้ ─────────
 
-def build_earnings_reminder():
+def build_earnings_reminder(chat_id):
     soon = []
-    for sym in stock_core.get_watchlist():
+    for sym in stock_core.get_watchlist(chat_id):
         try:
             d = stock_core.get_stock_data(sym)
         except Exception:
@@ -838,14 +838,14 @@ async def earnings_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     chat_ids = _load_chat_ids()
     if not chat_ids:
         return
-    try:
-        text = await asyncio.to_thread(build_earnings_reminder)
-    except Exception:
-        log.exception("earnings reminder failed")
-        return
-    if not text:
-        return
     for cid in chat_ids:
+        try:
+            text = await asyncio.to_thread(build_earnings_reminder, cid)
+        except Exception:
+            log.exception("earnings reminder failed (chat %s)", cid)
+            continue
+        if not text:
+            continue
         try:
             await context.bot.send_message(cid, text, parse_mode="HTML")
         except Exception:
@@ -1237,6 +1237,8 @@ def main():
     # startup digest หน่วง 300 วิ ให้ catch-up (วินาที 20) + news poll รอบแรก
     # (วินาที 120) ทำงานจบก่อน ข้อมูลเช้านี้จะได้อยู่ใน CSV แล้ว
     app.job_queue.run_once(startup_digest_job, when=300)
+    # ย้าย watchlist.json format เดิม (list) → per-user dict ให้เจ้าของ (ครั้งเดียว)
+    stock_core.migrate_legacy_watchlist(_load_chat_ids())
     app.run_polling(drop_pending_updates=True)
 
 
