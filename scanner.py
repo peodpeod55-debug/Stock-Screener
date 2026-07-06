@@ -21,10 +21,30 @@ MAX_DAYS_SINCE = 7      # สนใจเฉพาะหุ้นที่ออ
 MIN_CHANGE_PCT = 2.0    # วันตอบรับงบต้องปิดบวกอย่างน้อยกี่ %
 MIN_VOL_RATIO = 1.5     # วอลุ่มวันตอบรับต้องกี่เท่าของค่าเฉลี่ย 20 วัน
 
+
+def _env_value(key: str, default: str = "") -> str:
+    """อ่านค่าจาก environment variable หรือไฟล์ .env ข้างๆ สคริปต์
+    (สคริปต์นี้รันเดี่ยวได้ จึงอ่าน .env เองไม่ต้องพึ่ง telegram_bot)"""
+    val = os.environ.get(key, "").strip()
+    if val:
+        return val
+    env_path = os.path.join(_BASE_DIR, ".env")
+    if os.path.exists(env_path):
+        with open(env_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(f"{key}="):
+                    # strip quote ครอบ เผื่อผู้ใช้ใส่ path แบบ "..." หรือ '...'
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return default
+
+
 # ── โหมดสแกนทั้งตลาด: ใช้ข้อมูล parquet จากโปรเจค Trading_Dashboard ──
-# คัดหยาบจากไฟล์ในเครื่อง (883 ตัว ไม่ยิง Yahoo เลย) แล้วค่อยยืนยัน
+# คัดหยาบจากไฟล์ในเครื่อง (~883 ตัว ไม่ยิง Yahoo เลย) แล้วค่อยยืนยัน
 # เฉพาะตัวที่เข้าเกณฑ์ด้วยข้อมูลสด
-DASHBOARD_TH_CACHE = r"C:\Users\LEVEL51PC\Desktop\Dashboard\Trading_Dashboard\data_cache\TH"
+# ตั้ง path เอง (ต่อเครื่อง) ผ่าน DASHBOARD_TH_CACHE ใน .env — ถ้าเว้นว่าง
+# ระบบจะข้ามโหมดทั้งตลาด แล้วใช้โหมดรายชื่อหลัก (scan_universe.txt) แทน
+DASHBOARD_TH_CACHE = _env_value("DASHBOARD_TH_CACHE")
 LOCAL_MAX_AGE_DAYS = 5           # ข้อมูล dashboard เก่ากว่านี้ → ใช้สแกนปกติแทน
 MIN_AVG_VALUE_THB = 5_000_000    # กรองหุ้นสภาพคล่องต่ำ (มูลค่าซื้อขายเฉลี่ย/วัน)
 
@@ -44,6 +64,8 @@ def load_universe():
 
 def _local_parquet_files():
     import glob
+    if not DASHBOARD_TH_CACHE:
+        return []  # ไม่ได้ตั้ง path → ไม่มีข้อมูลทั้งตลาด (กันไป glob ผิดโฟลเดอร์)
     files = glob.glob(os.path.join(DASHBOARD_TH_CACHE, "*.parquet"))
     # ข้ามไฟล์ดัชนี เช่น ^SET.BK
     return [f for f in files if not os.path.basename(f).startswith("^")]
@@ -52,6 +74,8 @@ def _local_parquet_files():
 def local_data_last_date():
     """วันที่ล่าสุดของข้อมูลใน dashboard (ดูจากหุ้นใหญ่ที่เทรดทุกวัน)"""
     import pandas as pd
+    if not DASHBOARD_TH_CACHE:
+        return None
     for sym in ("AOT", "PTT", "KBANK"):
         fp = os.path.join(DASHBOARD_TH_CACHE, f"{sym}.parquet")
         if os.path.exists(fp):
