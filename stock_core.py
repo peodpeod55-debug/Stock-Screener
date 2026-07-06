@@ -358,43 +358,87 @@ def signal_score(d):
     return pts, stars
 
 
-# ── watchlist (หุ้นที่ติดตามหลังงบออก) ─────────────────────────
+# ── watchlist (หุ้นที่ติดตามหลังงบออก) — แยกตามผู้ใช้ (chat_id) ──
+# โครงสร้างไฟล์: {"<chat_id>": ["AOT", ...]}  (key เป็น string ตาม JSON)
 
 _WATCHLIST_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "watchlist.json"
 )
 
 
-def get_watchlist():
+def _load_watchlists() -> dict:
+    """คืน dict {chat_id_str: [symbols]} เสมอ
+    ถ้าไฟล์ยังเป็น format เดิม (list) คืน {} — รอ migrate_legacy_watchlist()"""
     try:
         with open(_WATCHLIST_PATH, encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except Exception:
-        return []
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
-def _save_watchlist(symbols):
+def _save_watchlists(data: dict):
     with open(_WATCHLIST_PATH, "w", encoding="utf-8") as f:
-        json.dump(symbols, f, ensure_ascii=False, indent=1)
+        json.dump(data, f, ensure_ascii=False, indent=1)
 
 
-def add_to_watchlist(ticker_input: str):
+def get_watchlist(chat_id):
+    """หุ้นที่ chat นี้ติดตาม (list ว่างถ้าไม่มี)"""
+    return list(_load_watchlists().get(str(chat_id), []))
+
+
+def add_to_watchlist(ticker_input: str, chat_id):
     base = _base_symbol(ticker_input)
-    symbols = get_watchlist()
+    data = _load_watchlists()
+    key = str(chat_id)
+    symbols = data.get(key, [])
     if base not in symbols:
         symbols.append(base)
-        _save_watchlist(symbols)
-    return base, symbols
+        data[key] = symbols
+        _save_watchlists(data)
+    return base, list(symbols)
 
 
-def remove_from_watchlist(ticker_input: str):
+def remove_from_watchlist(ticker_input: str, chat_id):
     base = _base_symbol(ticker_input)
-    symbols = get_watchlist()
+    data = _load_watchlists()
+    key = str(chat_id)
+    symbols = data.get(key, [])
     if base in symbols:
         symbols.remove(base)
-        _save_watchlist(symbols)
-        return base, symbols
-    return None, symbols
+        data[key] = symbols
+        _save_watchlists(data)
+        return base, list(symbols)
+    return None, list(symbols)
+
+
+def get_all_watched_symbols():
+    """union หุ้นของทุก chat (ให้ตัว monitor ดึงตัวละครั้ง)"""
+    seen = []
+    for syms in _load_watchlists().values():
+        for s in syms:
+            if s not in seen:
+                seen.append(s)
+    return seen
+
+
+def get_watchers(symbol: str):
+    """คืน list chat_id (str) ที่ติดตามหุ้นตัวนี้"""
+    return [cid for cid, syms in _load_watchlists().items() if symbol in syms]
+
+
+def migrate_legacy_watchlist(chat_ids) -> bool:
+    """ไฟล์ format เดิม (list ไม่ว่าง) → ยกให้ทุก chat_id ที่ส่งมา
+    ทำครั้งเดียว idempotent (dict อยู่แล้วไม่ทำอะไร) คืน True ถ้า migrate จริง"""
+    try:
+        with open(_WATCHLIST_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return False
+    if isinstance(data, list) and data and chat_ids:
+        _save_watchlists({str(cid): list(data) for cid in chat_ids})
+        return True
+    return False
 
 
 _RESULT_CACHE_MAX = 300
