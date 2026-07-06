@@ -722,13 +722,14 @@ def _save_watch_state(state):
 
 
 def check_watchlist_changes():
-    """คืน list ข้อความแจ้งเตือน (ว่าง = ไม่มีอะไรเปลี่ยน)"""
-    symbols = stock_core.get_watchlist()
+    """คืน dict {หุ้น: [ข้อความแจ้งเตือน]} (ว่าง = ไม่มีอะไรเปลี่ยน)
+    watch_state เป็น global ต่อหุ้น — คำนวณครั้งเดียว ผู้เรียก route เอง"""
+    symbols = stock_core.get_all_watched_symbols()
     if not symbols:
-        return []
+        return {}
     state = _load_watch_state()
     today = datetime.date.today().isoformat()
-    alerts = []
+    alerts = {}
     for sym in symbols:
         try:
             d = stock_core.get_stock_data(sym)
@@ -751,29 +752,32 @@ def check_watchlist_changes():
         if prev is not None:
             price_txt = (f"ราคา {d['price']:.2f} "
                          f"({format_signed_pct(d['day_change_pct'])} วันนี้)")
-            fired = False
+            msgs = []
             if prev.get("above_pre_low", True) and not cur["above_pre_low"]:
-                alerts.append(
+                msgs.append(
                     f"⛔ <b>{sym}</b> หลุด Low ก่อนงบ "
                     f"(<code>{s['pre_earn_low']:.2f}</code>) — สัญญาณเสีย\n{price_txt}"
                 )
-                fired = True
             if not prev.get("broke_pre3m_high") and cur["broke_pre3m_high"]:
-                alerts.append(
+                msgs.append(
                     f"🔥 <b>{sym}</b> ทะลุไฮ 3 เดือนก่อนงบ "
                     f"(<code>{s['pre3m_high']:.2f}</code>) แล้ว\n{price_txt}"
                 )
-                fired = True
             elif not prev.get("broke_pre5d_high") and cur["broke_pre5d_high"]:
-                alerts.append(
+                msgs.append(
                     f"✅ <b>{sym}</b> ผ่านไฮ 5 วันก่อนงบ "
                     f"(<code>{s['pre5d_high']:.2f}</code>) แล้ว\n{price_txt}"
                 )
-                fired = True
-            if (not fired and s["days_since_new_high"] == 0
+            if (not msgs and s["days_since_new_high"] == 0
                     and prev.get("new_high_date") != today):
-                alerts.append(f"📈 <b>{sym}</b> ทำไฮใหม่หลังงบวันนี้\n{price_txt}")
+                msgs.append(f"📈 <b>{sym}</b> ทำไฮใหม่หลังงบวันนี้\n{price_txt}")
+            if msgs:
+                alerts[sym] = msgs
         state[sym] = cur
+    # prune: ทิ้งสถานะหุ้นที่ไม่มีใครติดตามแล้ว (คง baseline-on-add ตอนเพิ่มกลับ)
+    for sym in list(state.keys()):
+        if sym not in symbols:
+            state.pop(sym, None)
     _save_watch_state(state)
     return alerts
 
@@ -788,14 +792,19 @@ async def watchlist_monitor_job(context: ContextTypes.DEFAULT_TYPE):
     if not chat_ids:
         return
     try:
-        alerts = await asyncio.to_thread(check_watchlist_changes)
+        alerts_by_symbol = await asyncio.to_thread(check_watchlist_changes)
     except Exception:
         log.exception("watchlist monitor failed")
         return
-    if not alerts:
+    if not alerts_by_symbol:
         return
-    text = "📣 <b>แจ้งเตือนลิสต์ติดตาม</b>\n\n" + "\n\n".join(alerts)
     for cid in chat_ids:
+        msgs = []
+        for sym in stock_core.get_watchlist(cid):
+            msgs.extend(alerts_by_symbol.get(sym, []))
+        if not msgs:
+            continue
+        text = "📣 <b>แจ้งเตือนลิสต์ติดตาม</b>\n\n" + "\n\n".join(msgs)
         try:
             await _send_long(context.bot, cid, text, parse_mode="HTML")
         except Exception:
