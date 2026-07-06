@@ -276,6 +276,7 @@ def f45_is_strong(parsed) -> bool:
 # ── สะสมตัวเลขงบลงไฟล์ (ไว้วิเคราะห์ว่างบโต → drift แรงจริงไหม) ──
 
 _RESULTS_PATH = os.path.join(_BASE_DIR, "earnings_results.csv")
+_FILINGS_PATH = os.path.join(_BASE_DIR, "filings_log.csv")
 
 
 def _log_f45_result(entry):
@@ -309,6 +310,25 @@ def _log_f45_result(entry):
                 f"{parsed['profit_prior'] / 1e6:.2f}",
                 f"{g:.1f}" if g is not None else "",
                 entry.get("f45") or "",
+            ])
+    except Exception:
+        pass  # ไฟล์เปิดค้างใน Excel ฯลฯ — อย่าให้ล้มการแจ้งเตือน
+
+
+def _log_filing(news_datetime, symbol, kinds):
+    """ต่อท้าย filings_log.csv — บันทึกดิบว่าใครแจ้งงบเมื่อไหร่ (ทุกข่าวงบ
+    ที่ยังไม่เคยเห็น รวมข่าวเก่าเกิน max_age_hours ด้วย) ใช้ทำสรุปงบเช้า
+    หนึ่งแถวต่อหนึ่งข่าว — หุ้นเดียวแจ้งหลายข่าวจะมีหลายแถว"""
+    is_new = not os.path.exists(_FILINGS_PATH)
+    try:
+        with open(_FILINGS_PATH, "a", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            if is_new:
+                w.writerow(["news_datetime", "symbol", "kinds"])
+            w.writerow([
+                news_datetime.strftime("%Y-%m-%d %H:%M"),
+                symbol,
+                "/".join(kinds),
             ])
     except Exception:
         pass  # ไฟล์เปิดค้างใน Excel ฯลฯ — อย่าให้ล้มการแจ้งเตือน
@@ -406,6 +426,7 @@ def check_new_earnings_news(max_age_hours: float = 14, days_back: int = 1):
             continue
         seen[it["id"]] = it["datetime"].isoformat()
         stock_core.set_manual_earnings_date(it["symbol"], it["datetime"].date())
+        _log_filing(it["datetime"], it["symbol"], [kind])
         if (now - it["datetime"]).total_seconds() / 3600 > max_age_hours:
             continue
         entry = by_symbol.setdefault(it["symbol"], {
@@ -451,6 +472,71 @@ def list_earnings_news(days_back: int = 1):
             entry["datetime"] = it["datetime"]
     _attach_f45_summaries(by_symbol)
     return sorted(by_symbol.values(), key=lambda x: x["datetime"], reverse=True)
+
+
+# ── อ่านย้อนหลังสำหรับ "สรุปงบเช้า" (ไม่ยิง Playwright เลย) ──────
+
+def load_results_since(dt):
+    """คืน list ของ dict จาก earnings_results.csv ที่ news_datetime >= dt
+    (profit แปลงเป็น float, yoy_pct เป็น float หรือ None)
+
+    ไฟล์ไม่มี/อ่านพัง → คืนลิสต์ว่าง แถวเสียข้ามไปเงียบๆ ไม่ล้ม caller"""
+    out = []
+    try:
+        with open(_RESULTS_PATH, encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                try:
+                    news_dt = datetime.datetime.strptime(
+                        r["news_datetime"], "%Y-%m-%d %H:%M").replace(tzinfo=_BKK)
+                    if news_dt < dt:
+                        continue
+                    yoy = r.get("yoy_pct") or ""
+                    out.append({
+                        "news_datetime": news_dt,
+                        "symbol": r["symbol"],
+                        "period": r.get("period") or "",
+                        "year": r.get("year") or "",
+                        "profit_mb": float(r["profit_mb"]),
+                        "profit_prior_mb": float(r["profit_prior_mb"]),
+                        "yoy_pct": float(yoy) if yoy else None,
+                        "summary": r.get("summary") or "",
+                    })
+                except (KeyError, ValueError, TypeError):
+                    continue  # แถวเสีย (คอลัมน์ขาด/parse ไม่ได้) — ข้าม
+    except Exception:
+        return []
+    return out
+
+
+def load_filings_since(dt):
+    """คืน {symbol: {"datetime": ..., "kinds": [...]}} จาก filings_log.csv
+    ตั้งแต่ dt เป็นต้นมา — เก็บเวลาล่าสุดต่อ symbol พร้อมรวม kinds ทุกแถว
+
+    ไฟล์ไม่มี/อ่านพัง → คืน dict ว่าง แถวเสียข้ามไปเงียบๆ ไม่ล้ม caller"""
+    out = {}
+    try:
+        with open(_FILINGS_PATH, encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                try:
+                    news_dt = datetime.datetime.strptime(
+                        r["news_datetime"], "%Y-%m-%d %H:%M").replace(tzinfo=_BKK)
+                    if news_dt < dt:
+                        continue
+                    sym = r["symbol"]
+                    kinds = [k for k in (r.get("kinds") or "").split("/") if k]
+                except (KeyError, ValueError, TypeError):
+                    continue  # แถวเสีย — ข้าม
+                entry = out.setdefault(sym, {"datetime": news_dt, "kinds": []})
+                for k in kinds:
+                    if k not in entry["kinds"]:
+                        entry["kinds"].append(k)
+                if news_dt > entry["datetime"]:
+                    entry["datetime"] = news_dt
+    except Exception:
+        return {}
+    return out
 
 
 if __name__ == "__main__":

@@ -107,6 +107,9 @@ AAA, BBB, CCC, ...
   - ข้ามเสาร์-อาทิตย์และวันหยุดตลาด (แบบเดียวกับ `heartbeat_job`/`news_monitor_job`)
   - ไม่มีหุ้นแจ้งงบใน window → **ไม่ส่งอะไรเลย** และ**ไม่**บันทึกสถานะ
   - ส่งสำเร็จ → บันทึก `digest_state.json` = `{"last_sent": "YYYY-MM-DD"}`
+  - **ทั้ง job รายวันและ startup digest ต้องเช็ค `last_sent` ก่อนส่ง** (เปิดบอท
+    ~08:35-08:50 → startup digest ส่งก่อน แล้ว 08:55 ต้องไม่ส่งซ้ำ) + ธง in-flight
+    ใน memory กันสอง job ยิงชนวินาทีเดียวกันก่อน state ถูกบันทึก
 - **startup digest**: ลงทะเบียน `run_once(startup_digest_job, when=300)`
   (300 วินาที — ให้ startup catch-up [วินาที 20] และ news poll รอบแรก [วินาที 120]
   ทำงานจบก่อน ข้อมูลเช้านี้จะได้อยู่ใน CSV แล้ว)

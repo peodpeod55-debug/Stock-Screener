@@ -270,9 +270,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• เตือนตอนเช้าถ้าหุ้นในลิสต์งบออกวันนี้/พรุ่งนี้\n\n"
         "<b>ข่าวแจ้งงบจากเว็บ SET</b>\n"
         "• <code>ข่าวงบ</code> — ใครแจ้งผลประกอบการแล้วบ้าง (2 วันล่าสุด)\n"
+        "• <code>สรุปงบ</code> — สรุปหุ้นแจ้งงบเมื่อวาน+เช้านี้ เรียงตามกำไรโต "
+        "(สรุปงบ 3 = ย้อน 3 วัน)\n"
         "• บอทเฝ้าข่าวให้เองทุก 10 นาที ช่วงเช้า/หลังปิดตลาด\n"
         "  เจอบริษัทแจ้งงบ → เตือนทันที + บันทึกวันงบอัตโนมัติ\n"
-        "  พร้อมตัวเลขจาก F45 เช่น กำไร 120.5 ลบ. (+45% YoY)\n\n"
+        "  พร้อมตัวเลขจาก F45 เช่น กำไร 120.5 ลบ. (+45% YoY)\n"
+        "• บอทส่งสรุปงบเช้าให้เองทุกวันทำการ 08:55 น.\n\n"
         "<b>สแกนหุ้นตอบรับงบดี</b>\n"
         "• <code>สแกน</code> — สแกนทั้งกระดานเดี๋ยวนี้ (~1-3 นาที)\n"
         "• อัตโนมัติทุกวันทำการ 17:30 น. บอทส่งผลให้เอง\n"
@@ -313,6 +316,7 @@ def _register_chat(chat_id: int):
 SCAN_HOUR, SCAN_MINUTE = 17, 30      # เวลาสแกนอัตโนมัติ (หลังตลาดปิด 16:30)
 REMIND_HOUR, REMIND_MINUTE = 8, 45   # เวลาเตือนวันงบตอนเช้า
 HEART_HOUR, HEART_MINUTE = 8, 30     # เวลาส่ง heartbeat เช้า
+DIGEST_HOUR, DIGEST_MINUTE = 8, 55   # เวลาส่งสรุปงบเช้า
 MONITOR_INTERVAL_MIN = 15            # เช็คลิสต์ติดตามทุกกี่นาที (ช่วงตลาดเปิด)
 NEWS_POLL_MINUTES = 10               # เช็คข่าวแจ้งงบจากเว็บ SET ทุกกี่นาที
 
@@ -487,6 +491,201 @@ def build_earnings_news_summary() -> str:
             lines.append(f"    {html.escape(r['f45'])}")
     lines += ["", "บันทึกวันงบเข้าระบบให้แล้ว — ดูปฏิกิริยาราคา: พิมพ์ชื่อหุ้น"]
     return "\n".join(lines)
+
+
+# ── สรุปงบเช้า: รวบหุ้นแจ้งงบตั้งแต่เย็นวาน+เช้านี้เป็นข้อความเดียว ──
+# ไม่ยิง Playwright เพิ่ม — อ่านจาก earnings_results.csv/filings_log.csv
+# ที่ job poll ข่าว (news_monitor_job) สะสมไว้แล้วเท่านั้น
+
+_DIGEST_STATE_PATH = os.path.join(_BASE_DIR, "digest_state.json")
+_THAI_WEEKDAY = ["จ", "อ", "พ", "พฤ", "ศ", "ส", "อา"]
+
+
+def _load_digest_state():
+    try:
+        with open(_DIGEST_STATE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_digest_state(state):
+    try:
+        with open(_DIGEST_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+def _digest_window_start(now: datetime.datetime) -> datetime.datetime:
+    """จุดเริ่ม window ปกติ: 09:00 ของวันทำการก่อนหน้า now (ข้ามเสาร์-อาทิตย์
+    และวันหยุดตลาด) — เช้าวันจันทร์เลยได้ศุกร์ 09:00 ครอบเสาร์-อาทิตย์ไปด้วย"""
+    day = now.date()
+    while True:
+        day -= datetime.timedelta(days=1)
+        if day.weekday() < 5 and not _is_market_holiday(day):
+            break
+    return datetime.datetime.combine(day, datetime.time(9, 0), tzinfo=now.tzinfo)
+
+
+def build_morning_digest(since_dt: datetime.datetime, now: datetime.datetime = None,
+                          window_label: str = None) -> str:
+    """ประกอบข้อความสรุปงบเช้า จากข้อมูลที่สะสมไว้แล้วเท่านั้น (ไม่ยิงเครือข่าย)
+
+    since_dt: จุดเริ่ม window (ดู _digest_window_start / คำสั่ง "สรุปงบ N")
+    window_label: ข้อความอธิบายช่วงเวลาในหัวเรื่อง (None = ใช้แบบ "ตั้งแต่เย็นวาน")
+    คืน "" ถ้าไม่มีบริษัทแจ้งงบเลยในช่วงนั้น (ผู้เรียกตัดสินใจเองว่าจะพิมพ์อะไร)
+    """
+    if now is None:
+        now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
+
+    results = set_news.load_results_since(since_dt)
+    filings = set_news.load_filings_since(since_dt)
+
+    # เฉพาะ symbol ล่าสุดของแต่ละตัวใน results (กันซ้ำถ้ามีหลายงวดในหน้าต่างเดียว)
+    latest_result = {}
+    for r in results:
+        cur = latest_result.get(r["symbol"])
+        if cur is None or r["news_datetime"] > cur["news_datetime"]:
+            latest_result[r["symbol"]] = r
+
+    watch = set(stock_core.get_watchlist())
+    uni = set(scanner.load_universe())
+
+    strong_in, strong_out, weak = [], [], []
+    for sym, r in latest_result.items():
+        parsed = {
+            "profit_cur": r["profit_mb"] * 1e6,
+            "profit_prior": r["profit_prior_mb"] * 1e6,
+        }
+        strong = set_news.f45_is_strong(parsed)
+        bucket = None
+        if strong:
+            bucket = strong_in if (sym in watch or sym in uni) else strong_out
+        else:
+            weak.append(r)
+            continue
+        bucket.append(r)
+
+    def sort_key(r):
+        # พลิกเป็นกำไรอยู่บนสุด (profit_prior_mb <= 0) เรียง profit_mb มาก→น้อย
+        # ที่เหลือเรียง yoy_pct มาก→น้อย
+        flipped = r["profit_prior_mb"] <= 0
+        return (0 if flipped else 1,
+                -r["profit_mb"] if flipped else 0,
+                -(r["yoy_pct"] if r["yoy_pct"] is not None else float("-inf")))
+
+    strong_in.sort(key=sort_key)
+    strong_out.sort(key=sort_key)
+    weak.sort(key=lambda r: (r["yoy_pct"] is None,
+                              -(r["yoy_pct"] if r["yoy_pct"] is not None else 0)))
+
+    # 📄 filings ที่ยังไม่มีตัวเลข (อยู่ใน filings_log แต่ไม่อยู่ใน results ของช่วงนี้)
+    numberless = sorted(sym for sym in filings if sym not in latest_result)
+
+    total_symbols = len(set(latest_result) | set(filings))
+    if total_symbols == 0:
+        return ""
+
+    idx = 0
+
+    def fmt_line(r, star):
+        nonlocal idx
+        idx += 1
+        mark = " ⭐" if star else ""
+        return f"{idx}. <b>{html.escape(r['symbol'])}</b>{mark}  {html.escape(r['summary'])}"
+
+    lines = []
+    weekday_th = _THAI_WEEKDAY[now.weekday()]
+    if window_label is None:
+        window_label = f"แจ้งงบตั้งแต่เย็นวาน {total_symbols} บริษัท"
+    lines.append(f"🌅 <b>สรุปงบเช้านี้</b> — {weekday_th} {now:%d/%m} ({window_label})")
+    lines.append("")
+
+    if strong_in:
+        lines.append(f"🔥 <b>งบโตแรง — อยู่ใน universe/ลิสต์</b> ({len(strong_in)})")
+        for r in strong_in:
+            lines.append(fmt_line(r, r["symbol"] in watch))
+        lines.append("")
+
+    if strong_out:
+        lines.append(f"🔥 <b>งบโตแรง — นอก universe</b> ({len(strong_out)})")
+        for r in strong_out:
+            lines.append(fmt_line(r, r["symbol"] in watch))
+        lines.append("")
+
+    if weak:
+        lines.append(f"📊 <b>มีตัวเลขแต่ไม่เข้าเกณฑ์โตแรง</b> ({len(weak)})")
+        for r in weak:
+            lines.append(fmt_line(r, r["symbol"] in watch))
+        lines.append("")
+
+    if numberless:
+        shown = ", ".join(html.escape(s) for s in numberless[:30])
+        if len(numberless) > 30:
+            shown += f" ...(+{len(numberless) - 30})"
+        lines.append(f"📄 แจ้งงบแล้วแต่ยังอ่านตัวเลขไม่ได้ ({len(numberless)}):")
+        lines.append(shown)
+        lines.append("")
+
+    lines.append("ดูปฏิกิริยาราคา: พิมพ์ชื่อหุ้น • เฝ้าตัวไหน: <code>ติดตาม XXX</code>")
+    lines.append("ตัวที่ตอบรับดีจะติดสแกนรอบ 17:30 วันนี้")
+    return "\n".join(lines)
+
+
+# สอง job (08:55 กับตอนเปิดบอท) อาจตกวันเดียวกัน — เช็ค last_sent ทั้งคู่
+# กันส่งซ้ำ + ธง in-flight กันกรณียิงชนวินาทีเดียวกัน (state ยังไม่ทันบันทึก)
+_digest_in_flight = False
+
+
+async def _run_morning_digest(context: ContextTypes.DEFAULT_TYPE, label: str):
+    """ตัวส่งสรุปงบเช้ากลาง: ส่งครั้งเดียวต่อวัน — ไม่มีข้อมูล = ไม่ส่ง ไม่บันทึกสถานะ"""
+    global _digest_in_flight
+    now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
+    if now.weekday() >= 5 or _is_market_holiday(now.date()):
+        return
+    if _digest_in_flight:
+        return
+    if _load_digest_state().get("last_sent") == now.date().isoformat():
+        return
+    chat_ids = _load_chat_ids()
+    if not chat_ids:
+        return
+    _digest_in_flight = True
+    try:
+        since_dt = _digest_window_start(now)
+        try:
+            text = await asyncio.to_thread(build_morning_digest, since_dt, now)
+        except Exception:
+            log.exception("%s failed", label)
+            return
+        if not text:
+            return
+        for cid in chat_ids:
+            try:
+                await _send_long(context.bot, cid, text, parse_mode="HTML")
+            except Exception:
+                log.exception("send %s failed (chat %s)", label, cid)
+        state = _load_digest_state()
+        state["last_sent"] = now.date().isoformat()
+        _save_digest_state(state)
+    finally:
+        _digest_in_flight = False
+
+
+async def morning_digest_job(context: ContextTypes.DEFAULT_TYPE):
+    """job รายวัน 08:55: สรุปงบเช้า"""
+    await _run_morning_digest(context, "morning digest")
+
+
+async def startup_digest_job(context: ContextTypes.DEFAULT_TYPE):
+    """ตอนเปิดบอท (หน่วง 300 วิ ให้ startup catch-up + news poll รอบแรกจบก่อน):
+    ถ้าวันนี้ยังไม่ได้ส่งสรุปงบเช้า และยังไม่สายเกิน 16:30 → ส่งเลย
+    (รองรับกรณีผู้ใช้เปิดคอมสาย ~09:30 เกินเวลา job 08:55 ไปแล้ว)"""
+    now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
+    if now.time() >= datetime.time(16, 30):
+        return
+    await _run_morning_digest(context, "startup morning digest")
 
 
 # ── แจ้งเตือนเมื่อสถานะหุ้นในลิสต์เปลี่ยน (เช็คช่วงตลาดเปิด) ────
@@ -870,6 +1069,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _reply_long(update.message, result, parse_mode="HTML")
         return
 
+    # สรุปงบเช้า: "สรุปงบ" (window ปกติ) / "สรุปงบ N" (ย้อน N วัน, clamp 1..7)
+    # อ่านจากไฟล์ล้วนๆ ไม่ยิงเครือข่าย — ตอบได้ทันทีไม่ต้องมีข้อความ "⏳ กำลัง..."
+    if tickers and tickers[0].lower() in ("สรุปงบ", "digest"):
+        now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
+        if len(tickers) >= 2 and tickers[1].isdigit():
+            n_days = max(1, min(7, int(tickers[1])))
+            since_dt = now - datetime.timedelta(days=n_days)
+            window_label = f"ย้อนหลัง {n_days} วัน"
+        else:
+            since_dt = _digest_window_start(now)
+            window_label = None
+        result = build_morning_digest(since_dt, now, window_label=window_label)
+        if not result:
+            await update.message.reply_text(
+                f"📭 ไม่มีบริษัทแจ้งงบตั้งแต่ {since_dt:%d/%m %H:%M} น. ครับ"
+            )
+            return
+        await _reply_long(update.message, result, parse_mode="HTML")
+        return
+
     # สถิติย้อนหลังจาก scan_log.csv: "สถิติ"
     if len(tickers) == 1 and tickers[0].lower() in ("สถิติ", "stats"):
         await update.message.reply_text(
@@ -951,7 +1170,9 @@ def main():
     print(f"  เตือนวันงบทุกวันทำการ เวลา {REMIND_HOUR:02d}:{REMIND_MINUTE:02d} น.")
     print(f"  เช็คลิสต์ติดตามทุก {MONITOR_INTERVAL_MIN} นาที ช่วงตลาดเปิด")
     print(f"  เฝ้าข่าวแจ้งงบ (เว็บ SET) ทุก {NEWS_POLL_MINUTES} นาที "
-          "ช่วง 07:00-09:45 และ 17:00-21:45\n")
+          "ช่วง 07:00-09:45 และ 17:00-21:45")
+    print(f"  สรุปงบเช้าทุกวันทำการ เวลา {DIGEST_HOUR:02d}:{DIGEST_MINUTE:02d} น. "
+          "(หรือส่งตอนเปิดบอทถ้ายังไม่ได้ส่ง)\n")
     log.info("bot starting")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -980,9 +1201,16 @@ def main():
         heartbeat_job,
         time=datetime.time(HEART_HOUR, HEART_MINUTE, tzinfo=ZoneInfo("Asia/Bangkok")),
     )
+    app.job_queue.run_daily(
+        morning_digest_job,
+        time=datetime.time(DIGEST_HOUR, DIGEST_MINUTE, tzinfo=ZoneInfo("Asia/Bangkok")),
+    )
     # จดเวลาว่ายังทำงานทุก 5 นาที + เก็บตกข่าวช่วงที่ปิดไป (ครั้งเดียวตอนเปิด)
     app.job_queue.run_repeating(alive_job, interval=300, first=10)
     app.job_queue.run_once(startup_catchup_job, when=20)
+    # startup digest หน่วง 300 วิ ให้ catch-up (วินาที 20) + news poll รอบแรก
+    # (วินาที 120) ทำงานจบก่อน ข้อมูลเช้านี้จะได้อยู่ใน CSV แล้ว
+    app.job_queue.run_once(startup_digest_job, when=300)
     app.run_polling(drop_pending_updates=True)
 
 
