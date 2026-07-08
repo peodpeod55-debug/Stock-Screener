@@ -22,3 +22,7 @@ digest_state.json
 
 # ตั้งค่าเฉพาะเครื่อง
 .claude/
+
+# สคริปต์ดึงข้อมูลจาก VPS (มี IP/user ของ VPS) + ข้อมูลที่ดึงลงมา
+ดึงข้อมูลจาก VPS.bat
+vps_data/
