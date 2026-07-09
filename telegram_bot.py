@@ -268,6 +268,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• บอทเช็คลิสต์ให้เองช่วงตลาดเปิด แจ้งทันทีเมื่อ\n"
         "  ทะลุไฮ 3 ด. / ผ่านไฮ 5 วัน / ทำไฮใหม่ / ⛔ หลุด Low ก่อนงบ\n"
         "• เตือนตอนเช้าถ้าหุ้นในลิสต์งบออกวันนี้/พรุ่งนี้\n\n"
+        "<b>ขนาดไม้ (เสี่ยง 1% ของพอร์ตต่อไม้)</b>\n"
+        "• <code>พอร์ต 500000</code> — ตั้งขนาดพอร์ต (ครั้งเดียว จำถาวร)\n"
+        "• <code>ไม้ AOT</code> — ควรซื้อกี่หุ้น ให้หลุด ⛔ แล้วเสียแค่ 1%\n"
+        "  (<code>ไม้ AOT 64.50</code> = ระบุราคาเข้าเอง)\n\n"
         "<b>ข่าวแจ้งงบจากเว็บ SET</b>\n"
         "• <code>ข่าวงบ</code> — ใครแจ้งผลประกอบการแล้วบ้าง (2 วันล่าสุด)\n"
         "• <code>สรุปงบ</code> — สรุปหุ้นแจ้งงบเมื่อวาน+เช้านี้ เรียงตามกำไรโต "
@@ -288,7 +292,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ทุกคำสั่งพิมพ์เป็นอังกฤษได้ (ตัวเล็ก-ใหญ่ไม่สำคัญ):\n"
         "<code>scan</code> / <code>news</code> / <code>digest</code> / "
         "<code>confirm</code> / <code>stats</code> / <code>earn AOT</code> / "
-        "<code>watch AOT</code> / <code>unwatch AOT</code> / <code>list</code>",
+        "<code>watch AOT</code> / <code>unwatch AOT</code> / <code>list</code> / "
+        "<code>port 500000</code> / <code>size AOT</code>",
         parse_mode="HTML",
     )
 
@@ -1270,6 +1275,120 @@ def build_watchlist_summary(chat_id) -> str:
     return "\n".join(lines)
 
 
+# ── คำนวณขนาดไม้ (position sizing) ตามกติกาท้าย workflow ─────────
+# เสี่ยงคงที่ RISK_PCT_PER_TRADE% ของพอร์ตต่อไม้: จำนวนหุ้น = เงินเสี่ยง
+# หารด้วยระยะจากราคาเข้าถึงเส้น ⛔ (Low 5 วันก่อนงบ) ปัดลงเป็น board lot
+# ขนาดพอร์ตตั้งครั้งเดียวต่อ chat เก็บใน port_settings.json
+
+RISK_PCT_PER_TRADE = 1.0   # % ของพอร์ตที่ยอมเสียต่อไม้
+BOARD_LOT = 100            # หุ้นไทยซื้อขายขั้นต่ำ lot ละ 100 หุ้น
+
+_PORT_SETTINGS_PATH = os.path.join(_BASE_DIR, "port_settings.json")
+
+
+def _load_port_settings():
+    try:
+        with open(_PORT_SETTINGS_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def get_port_size(chat_id):
+    v = _load_port_settings().get(str(chat_id))
+    try:
+        return float(v) if v else None
+    except (TypeError, ValueError):
+        return None
+
+
+def set_port_size(chat_id, value: float):
+    data = _load_port_settings()
+    data[str(chat_id)] = value
+    try:
+        with open(_PORT_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+    except Exception:
+        log.exception("save port settings failed")
+
+
+def build_position_size(chat_id, ticker_input: str, entry: float = None) -> str:
+    """คำนวณจำนวนหุ้นให้เสี่ยง RISK_PCT_PER_TRADE% ของพอร์ตพอดีถ้าหลุด ⛔
+
+    entry=None ใช้ราคาล่าสุด / ระบุเองได้กรณีวางแผนเข้าที่ราคาอื่น"""
+    port = get_port_size(chat_id)
+    if not port:
+        return ("ยังไม่ได้ตั้งขนาดพอร์ต — พิมพ์ <code>พอร์ต 500000</code> "
+                "ก่อนครับ (ตั้งครั้งเดียว บอทจำถาวร)")
+    try:
+        d = stock_core.get_stock_data(ticker_input)
+    except YFRateLimitError:
+        return "⏳ โดน Yahoo จำกัดการเรียกชั่วคราว — รอสักครู่แล้วลองใหม่ครับ"
+    if d is None:
+        return f"❌ ไม่พบข้อมูล {html.escape(ticker_input.upper())}"
+    base = d["ticker"].replace(".BK", "")
+    s = d.get("post_signals")
+    if not s or s.get("pre_earn_low") is None:
+        return (f"ยังไม่รู้วันงบล่าสุดของ <b>{html.escape(base)}</b> "
+                "เลยหาเส้น ⛔ (Low 5 วันก่อนงบ) ไม่ได้\n"
+                f"บันทึกวันงบก่อน: <code>งบ {html.escape(base)} 13/11/2569</code>")
+
+    stop = s["pre_earn_low"]
+    price = entry if entry is not None else d["price"]
+    if price <= stop:
+        return (f"⛔ ราคา {price:,.2f} ต่ำกว่า/เท่ากับเส้น ⛔ {stop:,.2f} แล้ว "
+                "— สัญญาณเสียตามกติกา ไม่ควรเข้าไม้นี้ครับ")
+
+    risk_amount = port * RISK_PCT_PER_TRADE / 100
+    per_share_risk = price - stop
+    shares = int(risk_amount / per_share_risk // BOARD_LOT) * BOARD_LOT
+    if shares <= 0:
+        lot_risk = per_share_risk * BOARD_LOT
+        return (f"ระยะเข้า {price:,.2f} → ⛔ {stop:,.2f} กว้างเกินสำหรับพอร์ตนี้\n"
+                f"ขั้นต่ำ 1 lot ({BOARD_LOT} หุ้น) หลุด ⛔ จะเสีย {lot_risk:,.0f} บ. "
+                f"≈ {lot_risk / port * 100:.1f}% ของพอร์ต "
+                f"(เกินเกณฑ์ {RISK_PCT_PER_TRADE:.0f}%) — ข้ามตัวนี้ดีกว่าครับ")
+
+    cost = shares * price
+    capped = False
+    if cost > port:
+        # ตามสูตรต้องใช้เงินมากกว่าที่มี (⛔ ชิดราคามาก) — ลดเหลือเท่าที่ซื้อไหว
+        shares = int(port / price // BOARD_LOT) * BOARD_LOT
+        if shares <= 0:
+            return (f"ราคา {price:,.2f} ต่อหุ้น 1 lot ({BOARD_LOT} หุ้น) "
+                    "แพงกว่าพอร์ตทั้งก้อน — ซื้อไม่ได้ครับ")
+        cost = shares * price
+        capped = True
+    actual_risk = shares * per_share_risk
+
+    dist_pct = (stop - price) / price * 100
+    when = (f"ราคาเข้าที่ระบุเอง" if entry is not None
+            else f"ราคาล่าสุด {d['fetched_time']} น.")
+    lines = [
+        f"📐 <b>ขนาดไม้ {html.escape(base)}</b> — พอร์ต {port:,.0f} บ. "
+        f"เสี่ยง {RISK_PCT_PER_TRADE:.0f}%/ไม้",
+        f"เข้า {price:,.2f} ({when}) → เส้น ⛔ {stop:,.2f} ({dist_pct:.1f}%)",
+        "",
+        f"ซื้อ <b>{shares:,} หุ้น</b> ≈ {cost:,.0f} บ. "
+        f"({cost / port * 100:.1f}% ของพอร์ต)",
+        f"หลุด ⛔ ขาดทุน ~{actual_risk:,.0f} บ. "
+        f"({actual_risk / port * 100:.2f}% ของพอร์ต)",
+    ]
+    if capped:
+        lines.append(f"⚠️ ตามสูตรต้องใช้เงินเกินพอร์ต — ปรับลงเหลือเท่าที่ซื้อไหว "
+                     f"ความเสี่ยงจริงจึงต่ำกว่าเกณฑ์")
+    elif cost / port > 0.30:
+        lines.append("⚠️ ไม้นี้กินพอร์ตเกิน 30% (เส้น ⛔ ชิดราคาทำให้ไม้ใหญ่) "
+                     "— เงินจมกระจุกตัว พิจารณาลดขนาดเอง")
+    if (d["days_since_earnings"] or 0) > 60:
+        lines.append(f"⚠️ งบออกมา {d['days_since_earnings']} วันแล้ว "
+                     "— เส้น ⛔ ก่อนงบอาจหมดความหมายไปแล้ว")
+    lines.append("")
+    lines.append(f"เส้น ⛔ = Low 5 วันก่อนงบ — <code>ติดตาม {html.escape(base)}</code> "
+                 "แล้วบอทเฝ้าให้ทุก 15 นาที")
+    return "\n".join(lines)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _register_chat(update.effective_chat.id)
     text = update.message.text.strip()
@@ -1348,6 +1467,72 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # คำสั่งจัดการวันประกาศงบ: "งบ AOT" / "งบ AOT 13/11/2569"
     if tickers and tickers[0].lower() in ("งบ", "earn", "earnings"):
         result = await asyncio.to_thread(handle_earnings_command, tickers)
+        await update.message.reply_text(result, parse_mode="HTML")
+        return
+
+    # ตั้ง/ดูขนาดพอร์ต: "พอร์ต 500000" / "พอร์ต"
+    if tickers and tickers[0].lower() in ("พอร์ต", "port"):
+        chat_id = update.effective_chat.id
+        if len(tickers) == 1:
+            port = get_port_size(chat_id)
+            if port:
+                await update.message.reply_text(
+                    f"💼 พอร์ตปัจจุบัน {port:,.0f} บาท — "
+                    f"เสี่ยง {RISK_PCT_PER_TRADE:.0f}%/ไม้ "
+                    f"= {port * RISK_PCT_PER_TRADE / 100:,.0f} บ.\n"
+                    "เปลี่ยน: <code>พอร์ต 600000</code>",
+                    parse_mode="HTML",
+                )
+            else:
+                await update.message.reply_text(
+                    "ยังไม่ได้ตั้งขนาดพอร์ต — พิมพ์ <code>พอร์ต 500000</code>",
+                    parse_mode="HTML",
+                )
+            return
+        try:
+            value = float(tickers[1].replace(",", ""))
+            if value <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "ใส่ตัวเลขบาท เช่น <code>พอร์ต 500000</code>", parse_mode="HTML"
+            )
+            return
+        set_port_size(chat_id, value)
+        await update.message.reply_text(
+            f"✅ ตั้งพอร์ต {value:,.0f} บาทแล้ว — "
+            f"เสี่ยง {RISK_PCT_PER_TRADE:.0f}%/ไม้ "
+            f"= {value * RISK_PCT_PER_TRADE / 100:,.0f} บ.\n"
+            f"คำนวณขนาดไม้: <code>ไม้ AOT</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    # คำนวณขนาดไม้: "ไม้ AOT" (เข้าราคาตอนนี้) / "ไม้ AOT 64.50" (ระบุราคาเข้า)
+    if tickers and tickers[0].lower() in ("ไม้", "size"):
+        if len(tickers) < 2:
+            await update.message.reply_text(
+                "พิมพ์ <code>ไม้ AOT</code> (เข้าราคาตอนนี้) หรือ "
+                "<code>ไม้ AOT 64.50</code> (ระบุราคาเข้าเอง)",
+                parse_mode="HTML",
+            )
+            return
+        entry = None
+        if len(tickers) >= 3:
+            try:
+                entry = float(tickers[2].replace(",", ""))
+                if entry <= 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text(
+                    "ราคาเข้าต้องเป็นตัวเลข เช่น <code>ไม้ AOT 64.50</code>",
+                    parse_mode="HTML",
+                )
+                return
+        await update.message.reply_text("⏳ กำลังคำนวณขนาดไม้...")
+        result = await asyncio.to_thread(
+            build_position_size, update.effective_chat.id, tickers[1], entry
+        )
         await update.message.reply_text(result, parse_mode="HTML")
         return
 

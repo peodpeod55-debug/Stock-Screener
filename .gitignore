@@ -19,6 +19,7 @@ backtest_results.csv
 last_alive.json
 filings_log.csv
 digest_state.json
+port_settings.json
 
 # ตั้งค่าเฉพาะเครื่อง
 .claude/

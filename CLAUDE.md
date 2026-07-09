@@ -62,7 +62,8 @@ backtest.py           ← จำลองระบบคะแนนกับว
 | ตอนเปิดบอท (หน่วง 300 วิ) | startup digest: ส่งสรุปงบเช้าถ้าวันนี้ยังไม่ได้ส่ง (รองรับผู้ใช้เปิดคอมสาย ~09:30 เกินเวลา job 08:55) — ยืนยันรอบเช้าก็มี fallback แบบเดียวกัน (หน่วง 330 วิ, เฉพาะช่วง 10:30-12:00) |
 
 - ถ้าดึงข่าว SET ล้มเหลวติดต่อกัน ≥3 รอบ (~30 นาที) บอทเด้ง ⚠️ เตือนผู้ใช้เองครั้งเดียวต่อการล่มหนึ่งช่วง และแจ้ง ✅ เมื่อกลับมาปกติ (ตัวนับใน memory ของ `news_monitor_job`)
-- คำสั่งผู้ใช้เป็น**ข้อความภาษาไทยธรรมดา** (สแกน / ติดตาม XXX / ลิสต์ / สถิติ / งบ XXX วันที่ / ข่าวงบ / สรุปงบ N / ยืนยัน) ผ่าน `handle_text()` — ไม่ใช่ slash command และทุกคำสั่งมี alias อังกฤษ (scan/watch/unwatch/list/stats/earn/news/digest/confirm) เช็คแบบ case-insensitive — เพิ่มคำสั่งใหม่ต้องมี alias อังกฤษด้วย
+- คำสั่งผู้ใช้เป็น**ข้อความภาษาไทยธรรมดา** (สแกน / ติดตาม XXX / ลิสต์ / สถิติ / งบ XXX วันที่ / ข่าวงบ / สรุปงบ N / ยืนยัน / พอร์ต N / ไม้ XXX) ผ่าน `handle_text()` — ไม่ใช่ slash command และทุกคำสั่งมี alias อังกฤษ (scan/watch/unwatch/list/stats/earn/news/digest/confirm/port/size) เช็คแบบ case-insensitive — เพิ่มคำสั่งใหม่ต้องมี alias อังกฤษด้วย
+- position sizing (`ไม้ XXX`): เสี่ยง `RISK_PCT_PER_TRADE` (1%) ของพอร์ตต่อไม้ ÷ ระยะราคาเข้า→เส้น ⛔ (pre_earn_low) ปัดลง lot ละ 100 — ขนาดพอร์ตเก็บต่อ chat ใน `port_settings.json`
 - ข้อความ Telegram เป็น HTML, จำกัด 3900 ตัวอักษร/ข้อความ — ส่งข้อความยาวต้องใช้ `_reply_long` / `_send_long`
 - แนวคิดสามคำสั่งหลัก: **สแกนหา → ติดตามเฝ้า → ลิสต์ดู** — เฉพาะ "ติดตาม" เท่านั้นที่ทำให้บอทเฝ้าและเด้งเตือน
 
@@ -80,7 +81,7 @@ backtest.py           ← จำลองระบบคะแนนกับว
 
 ## ไฟล์ข้อมูล/สถานะ (gitignore ทั้งหมด — อย่า commit)
 
-`.env` (BOT_TOKEN), `watchlist.json`, `chat_ids.json`, `news_seen.json`, `last_alive.json`, `watch_state.json`, `scan_log.csv`, `lookup_log.csv`, `backtest_results.csv`, `bot_log.txt`, `.yf_cache/`, `filings_log.csv` (ใครแจ้งงบเมื่อไหร่ — ดิบกว่า earnings_results.csv รวมตัวที่อ่านตัวเลขไม่ได้ด้วย), `digest_state.json` (กันส่งสรุปงบเช้า/ยืนยันรอบเช้าซ้ำในวันเดียว — key `last_sent` / `confirm_last_sent`)
+`.env` (BOT_TOKEN), `watchlist.json`, `chat_ids.json`, `news_seen.json`, `last_alive.json`, `watch_state.json`, `scan_log.csv`, `lookup_log.csv`, `backtest_results.csv`, `bot_log.txt`, `.yf_cache/`, `filings_log.csv` (ใครแจ้งงบเมื่อไหร่ — ดิบกว่า earnings_results.csv รวมตัวที่อ่านตัวเลขไม่ได้ด้วย), `digest_state.json` (กันส่งสรุปงบเช้า/ยืนยันรอบเช้าซ้ำในวันเดียว — key `last_sent` / `confirm_last_sent`), `port_settings.json` (ขนาดพอร์ตต่อ chat สำหรับคำนวณขนาดไม้)
 
 ไฟล์ log แบบ append (scan_log, lookup_log) คือข้อมูลสะสมที่ใช้วิเคราะห์ย้อนหลัง — เปลี่ยน schema คอลัมน์ต้องระวังไฟล์เก่าที่มีอยู่
 
