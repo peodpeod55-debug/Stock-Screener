@@ -1090,6 +1090,21 @@ def _watch_buttons(hits, limit=15):
     return InlineKeyboardMarkup(rows)
 
 
+def _unwatch_buttons(symbols, limit=15):
+    """ปุ่ม 🗑 เอาออกจากลิสต์ (ใต้สรุป "ลิสต์" — เฉพาะตัวที่หมดสภาพ)"""
+    if not symbols:
+        return None
+    rows, row = [], []
+    for s in symbols[:limit]:
+        row.append(InlineKeyboardButton(f"🗑 {s}", callback_data=f"unwatch:{s}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     data = q.data or ""
@@ -1106,6 +1121,22 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
+    elif data.startswith("unwatch:"):
+        base, symbols = stock_core.remove_from_watchlist(
+            data.split(":", 1)[1], update.effective_chat.id
+        )
+        if base:
+            await q.answer(f"เอา {base} ออกแล้ว (เหลือ {len(symbols)} ตัว)")
+            try:
+                await q.message.reply_text(
+                    f"🗑 เอา <b>{html.escape(base)}</b> ออกจากลิสต์แล้ว "
+                    f"(เหลือ {len(symbols)} ตัว)",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        else:
+            await q.answer("ตัวนี้ไม่อยู่ในลิสต์แล้ว (กดซ้ำ?)")
     else:
         await q.answer()
 
@@ -1217,7 +1248,7 @@ def build_watchlist_summary(chat_id) -> str:
         return (
             "📋 ยังไม่มีหุ้นในลิสต์\n"
             "เพิ่มด้วย: <code>ติดตาม AOT</code>"
-        )
+        ), []
 
     rows = []
     errors = []
@@ -1241,6 +1272,7 @@ def build_watchlist_summary(chat_id) -> str:
     rows.sort(key=rank_key, reverse=True)
 
     lines = ["📋 <b>หุ้นที่ติดตาม</b> (เรียงตามคะแนนสัญญาณหลังงบ)", ""]
+    stale = []  # ตัวหมดสภาพ — ไว้ทำปุ่ม 🗑 ให้กดเอาออก
     for i, d in enumerate(rows, 1):
         base = d["ticker"].replace(".BK", "")
         r = d["earn_reaction"]
@@ -1274,12 +1306,33 @@ def build_watchlist_summary(chat_id) -> str:
         lines.append(f"    วันนี้ {format_signed_pct(d['day_change_pct'])}{since_txt}")
         if flags:
             lines.append("    " + " • ".join(flags))
+
+        # ── สุขอนามัยลิสต์: ตัวไหนหมดสภาพ ป้ายเหตุผล + เข้าคิวปุ่ม 🗑 ──
+        # ยกเว้นตัวที่กำลังรองบรอบใหม่ (ผู้ใช้ติดตามล่วงหน้าเพื่อรอเตือน
+        # 08:45 — อย่าชวนลบทิ้ง)
+        waiting = (d["days_to_earnings"] is not None
+                   and d["days_to_earnings"] <= 14)
+        reason = None
+        if waiting:
+            pass
+        elif s is None:
+            reason = "ไม่รู้วันงบ (บอทเฝ้าสัญญาณให้ไม่ได้)"
+        elif not s["above_pre_low"]:
+            reason = "โดน ⛔ ไปแล้ว — ตามกติกาต้องออก"
+        elif (d["days_since_earnings"] or 0) > 60:
+            reason = f"งบผ่านมา {d['days_since_earnings']} วัน — สัญญาณหมดอายุ (60 วัน)"
+        if reason:
+            stale.append(base)
+            lines.append(f"    🗑 {reason}")
     if errors:
         lines.append("")
         lines.append("⚠️ ดึงไม่ได้: " + ", ".join(errors))
     lines.append("")
-    lines.append("ลบออก: <code>เลิกติดตาม AOT</code>")
-    return "\n".join(lines)
+    if stale:
+        lines.append("🗑 ตัวที่หมดสภาพ กดปุ่มด้านล่างเอาออกได้เลย "
+                     "(กันลิสต์บวมจนบังตัวที่ยังมีสัญญาณ)")
+    lines.append("ลบเอง: <code>เลิกติดตาม AOT</code>")
+    return "\n".join(lines), stale
 
 
 # ── คำนวณขนาดไม้ (position sizing) ตามกติกาท้าย workflow ─────────
@@ -1796,10 +1849,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if len(tickers) == 1 and tickers[0].lower() in ("ลิสต์", "list", "watchlist"):
         await update.message.reply_text("⏳ กำลังสรุปลิสต์...")
-        result = await asyncio.to_thread(
+        result, stale = await asyncio.to_thread(
             build_watchlist_summary, update.effective_chat.id
         )
-        await _reply_long(update.message, result, parse_mode="HTML")
+        await _reply_long(update.message, result,
+                          reply_markup=_unwatch_buttons(stale), parse_mode="HTML")
         return
 
     if len(tickers) > MAX_TICKERS:
