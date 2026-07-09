@@ -2,6 +2,8 @@
 
 ตอบคำถามสำคัญ: คะแนนสัญญาณหลังงบ (0-12) ทำนายผลได้จริงไหม
 วัดผลตอบแทน 5 / 10 / 20 วันทำการหลังวันสแกน แยกตามช่วงคะแนน
+ต่อท้ายด้วยผลไม้จริงจาก trades_log.csv (คำสั่ง ซื้อ/ขาย ในบอท)
+เทียบตามช่วงคะแนนเดียวกัน — execution ตามระบบทันหรือเปล่า
 รันเองก็ได้ (python stats.py) หรือพิมพ์ "สถิติ" ในแชทบอท
 """
 import os
@@ -86,51 +88,104 @@ def _forward_returns(rows):
     return results
 
 
-def build_stats_report(html: bool = True) -> str:
+def _trades_section(b, chat_id=None):
+    """สรุปผลไม้จริงจาก trades_log.csv — เทียบกับผลระบบตามช่วงคะแนนเดียวกัน
+    (ไม่มีไฟล์/ไม่เคยบันทึก = คืนลิสต์ว่าง ไม่แสดงหัวข้อ)"""
+    closed, open_ = stock_core.pair_trades(stock_core.load_trades(chat_id))
+    if not closed and not open_:
+        return []
+
+    lines = ["", b("💼 ผลไม้จริง (บันทึกด้วย ซื้อ/ขาย)")
+             + f" — ปิดแล้ว {len(closed)} ไม้"
+             + (f" เปิดอยู่ {len(open_)}" if open_ else "")]
+    if not closed:
+        lines.append("  ยังไม่มีไม้ที่ปิดครบวงจร — ขายเมื่อไหร่ตัวเลขจะขึ้นที่นี่")
+        return lines
+
+    def pct(p):
+        return (p["sell"]["price"] - p["buy"]["price"]) / p["buy"]["price"] * 100
+
+    pcts = [pct(p) for p in closed]
+    wins = sum(1 for x in pcts if x > 0)
+    lines.append(f"  ชนะ {wins}/{len(closed)} ({wins / len(closed) * 100:.0f}%)"
+                 f"  เฉลี่ย {sum(pcts) / len(pcts):+.1f}%")
+    rs = [(p["sell"]["price"] - p["buy"]["price"])
+          / (p["buy"]["price"] - p["buy"]["stop"])
+          for p in closed
+          if p["buy"]["stop"] is not None and p["buy"]["price"] > p["buy"]["stop"]]
+    if rs:
+        lines.append(f"  R-multiple เฉลี่ย {sum(rs) / len(rs):+.2f}R"
+                     f"  รวม {sum(rs):+.1f}R ({len(rs)} ไม้ที่รู้เส้น ⛔)")
+
+    # แยกตามคะแนนระบบ ณ ตอนเข้า — วางเทียบกับตารางสถิติสแกนข้างบนตรงๆ
+    band_lines = []
+    for lo, hi, label in BANDS:
+        band = [p for p in closed
+                if p["buy"]["score"] is not None and lo <= p["buy"]["score"] <= hi]
+        if not band:
+            continue
+        bp = [pct(p) for p in band]
+        bw = sum(1 for x in bp if x > 0)
+        band_lines.append(f"  {label}: ชนะ {bw}/{len(band)}"
+                          f"  เฉลี่ย {sum(bp) / len(bp):+.1f}%")
+    if band_lines:
+        lines.append("  แยกตามคะแนน ณ ตอนเข้า:")
+        lines += band_lines
+    no_score = sum(1 for p in closed if p["buy"]["score"] is None)
+    if no_score:
+        lines.append(f"  (อีก {no_score} ไม้ไม่มีคะแนนบันทึกไว้ตอนเข้า)")
+    return lines
+
+
+def build_stats_report(html: bool = True, chat_id=None) -> str:
+    """chat_id: จำกัดส่วนไม้จริงเฉพาะ chat นั้น (None = ทุก chat — โหมด CLI)"""
     b = (lambda t: f"<b>{t}</b>") if html else (lambda t: t)
     rows = _load_rows()
+    lines = []
     if not rows:
-        return (
+        lines.append(
             "📈 ยังไม่มีข้อมูลสะสมใน scan_log.csv พอให้วิเคราะห์\n"
             "ปล่อยให้ระบบสแกนเก็บผลไปสักระยะ (ผลสแกนทุกรอบถูกบันทึกอัตโนมัติ)\n"
             "แล้วค่อยพิมพ์ \"สถิติ\" อีกครั้งครับ"
         )
-
-    results = _forward_returns(rows)
-    if not results:
-        return (
-            "⚠️ ยังคำนวณไม่ได้ — รายการในบันทึกอาจใหม่เกินไป "
-            "(ยังไม่ครบ 5 วันทำการ) หรือดึงราคาย้อนหลังไม่สำเร็จ"
-        )
-
-    lines = [
-        f"📈 {b('สถิติหุ้นติดสแกน')} — {len(results)} รายการจาก scan_log.csv",
-        "(วัดจากราคาปิดวันสแกน → อีก 5/10/20 วันทำการ)",
-        "",
-    ]
-    for lo, hi, label in BANDS:
-        band = [r for r in results if lo <= r["score"] <= hi]
-        if not band:
-            continue
-        lines.append(b(f"คะแนน {label}") + f" — {len(band)} รายการ")
-        for h in HORIZONS:
-            rets = [r["returns"][h] for r in band if h in r["returns"]]
-            if not rets:
-                continue
-            wins = sum(1 for x in rets if x > 0)
-            avg = sum(rets) / len(rets)
-            best = max(rets)
-            worst = min(rets)
+    else:
+        results = _forward_returns(rows)
+        if not results:
             lines.append(
-                f"  +{h} วัน : ชนะ {wins}/{len(rets)} ({wins / len(rets) * 100:.0f}%)"
-                f"  เฉลี่ย {avg:+.1f}%  (ดีสุด {best:+.1f} / แย่สุด {worst:+.1f})"
+                "⚠️ ยังคำนวณไม่ได้ — รายการในบันทึกอาจใหม่เกินไป "
+                "(ยังไม่ครบ 5 วันทำการ) หรือดึงราคาย้อนหลังไม่สำเร็จ"
             )
-        lines.append("")
+        else:
+            lines += [
+                f"📈 {b('สถิติหุ้นติดสแกน')} — {len(results)} รายการจาก scan_log.csv",
+                "(วัดจากราคาปิดวันสแกน → อีก 5/10/20 วันทำการ)",
+                "",
+            ]
+            for lo, hi, label in BANDS:
+                band = [r for r in results if lo <= r["score"] <= hi]
+                if not band:
+                    continue
+                lines.append(b(f"คะแนน {label}") + f" — {len(band)} รายการ")
+                for h in HORIZONS:
+                    rets = [r["returns"][h] for r in band if h in r["returns"]]
+                    if not rets:
+                        continue
+                    wins = sum(1 for x in rets if x > 0)
+                    avg = sum(rets) / len(rets)
+                    best = max(rets)
+                    worst = min(rets)
+                    lines.append(
+                        f"  +{h} วัน : ชนะ {wins}/{len(rets)} ({wins / len(rets) * 100:.0f}%)"
+                        f"  เฉลี่ย {avg:+.1f}%  (ดีสุด {best:+.1f} / แย่สุด {worst:+.1f})"
+                    )
+                lines.append("")
 
-    pending = len(rows) - len(results)
-    if pending > 0:
-        lines.append(f"(อีก {pending} รายการยังวัดไม่ได้ — ใหม่เกินไปหรือดึงราคาไม่สำเร็จ)")
-    lines.append("หมายเหตุ: ตัวเลขไม่รวมค่าธรรมเนียม และวัดแบบถือครบกำหนดเท่านั้น")
+            pending = len(rows) - len(results)
+            if pending > 0:
+                lines.append(f"(อีก {pending} รายการยังวัดไม่ได้ — ใหม่เกินไปหรือดึงราคาไม่สำเร็จ)")
+            lines.append("หมายเหตุ: ตัวเลขไม่รวมค่าธรรมเนียม และวัดแบบถือครบกำหนดเท่านั้น")
+
+    lines += _trades_section(b, chat_id)
     return "\n".join(lines)
 
 

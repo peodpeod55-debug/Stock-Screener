@@ -272,6 +272,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• <code>พอร์ต 500000</code> — ตั้งขนาดพอร์ต (ครั้งเดียว จำถาวร)\n"
         "• <code>ไม้ AOT</code> — ควรซื้อกี่หุ้น ให้หลุด ⛔ แล้วเสียแค่ 1%\n"
         "  (<code>ไม้ AOT 64.50</code> = ระบุราคาเข้าเอง)\n\n"
+        "<b>บันทึกไม้จริง (trade journal)</b>\n"
+        "• <code>ซื้อ AOT 32.50</code> — จดไม้เข้า พร้อมเก็บคะแนน/เส้น ⛔\n"
+        "  ณ ตอนเข้า (ใส่จำนวนหุ้นได้: <code>ซื้อ AOT 32.50 300</code>)\n"
+        "• <code>ขาย AOT 35.00</code> — ปิดไม้ สรุป % กำไรและ R ทันที\n"
+        "• <code>เทรด</code> — ไม้ที่เปิดอยู่ + ผลไม้ที่ปิดแล้ว\n"
+        "• <code>สถิติ</code> เทียบผลไม้จริงกับผลระบบให้อัตโนมัติ\n\n"
         "<b>ข่าวแจ้งงบจากเว็บ SET</b>\n"
         "• <code>ข่าวงบ</code> — ใครแจ้งผลประกอบการแล้วบ้าง (2 วันล่าสุด)\n"
         "• <code>สรุปงบ</code> — สรุปหุ้นแจ้งงบเมื่อวาน+เช้านี้ เรียงตามกำไรโต "
@@ -293,7 +299,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>scan</code> / <code>news</code> / <code>digest</code> / "
         "<code>confirm</code> / <code>stats</code> / <code>earn AOT</code> / "
         "<code>watch AOT</code> / <code>unwatch AOT</code> / <code>list</code> / "
-        "<code>port 500000</code> / <code>size AOT</code>",
+        "<code>port 500000</code> / <code>size AOT</code> / "
+        "<code>buy AOT 32.50</code> / <code>sell AOT 35</code> / <code>trades</code>",
         parse_mode="HTML",
     )
 
@@ -1389,6 +1396,149 @@ def build_position_size(chat_id, ticker_input: str, entry: float = None) -> str:
     return "\n".join(lines)
 
 
+# ── บันทึกไม้จริง (trade journal): ซื้อ / ขาย / เทรด ─────────────
+# เก็บลง trades_log.csv ผ่าน stock_core.log_trade — แถวซื้อเก็บบริบท
+# ณ ตอนเข้า (วันงบ/เส้น ⛔/คะแนน) เพื่อให้ "สถิติ" เทียบผลจริงกับ
+# ผลระบบย้อนหลังได้
+
+
+def record_buy(chat_id, ticker_input: str, price: float, shares=None) -> str:
+    """บันทึกไม้ซื้อ + เก็บบริบทระบบ ณ ตอนเข้า (ดึง Yahoo ตัวเดียว)"""
+    existing = stock_core.get_open_trade(chat_id, ticker_input)
+    if existing:
+        base = existing["symbol"]
+        return (f"มีไม้ <b>{html.escape(base)}</b> เปิดอยู่แล้ว "
+                f"(ซื้อ {existing['price']:,.2f} เมื่อ {existing['datetime']:%d/%m})\n"
+                f"ปิดก่อนด้วย <code>ขาย {html.escape(base)} ราคา</code> "
+                "ถึงจะเปิดไม้ใหม่ได้ครับ")
+
+    # บริบทระบบ ณ ตอนเข้า — ดึงไม่ได้ก็บันทึกไม้ได้ (ช่องว่าง)
+    earn_date = stop = score = None
+    base = ticker_input.upper().replace(".BK", "")
+    try:
+        d = stock_core.get_stock_data(ticker_input)
+    except Exception:
+        d = None
+    if d is not None:
+        base = d["ticker"].replace(".BK", "")
+        earn_date = d.get("last_earnings")
+        s = d.get("post_signals")
+        if s:
+            stop = s.get("pre_earn_low")
+        score, _ = stock_core.signal_score(d)
+
+    stock_core.log_trade(chat_id, base, "buy", price, shares=shares,
+                         earn_date=earn_date, stop=stop, score=score)
+
+    lines = [f"📝 บันทึกซื้อ <b>{html.escape(base)}</b> @ {price:,.2f}"
+             + (f" × {shares:,} หุ้น ≈ {price * shares:,.0f} บ." if shares else "")]
+    if stop is not None:
+        dist = (stop - price) / price * 100
+        lines.append(f"เส้น ⛔ {stop:,.2f} ({dist:.1f}%)"
+                     + (f" — หลุดแล้วเสีย ~{(price - stop) * shares:,.0f} บ."
+                        if shares else ""))
+        if price <= stop:
+            lines.append("⚠️ ราคาซื้อต่ำกว่าเส้น ⛔ อยู่แล้ว — นอกกติการะบบนะครับ")
+    if score is not None:
+        lines.append(f"คะแนนระบบ ณ ตอนเข้า: {score}/{stock_core.SCORE_MAX}")
+    if d is None:
+        lines.append("(ดึงข้อมูลระบบไม่ได้ — บันทึกเฉพาะราคา)")
+    lines.append("")
+    tail = (f"ปิดไม้: <code>ขาย {html.escape(base)} ราคา</code> • "
+            "ดูไม้ทั้งหมด: <code>เทรด</code>")
+    if base not in stock_core.get_watchlist(chat_id):
+        tail += f" • เฝ้า ⛔ ให้: <code>ติดตาม {html.escape(base)}</code>"
+    lines.append(tail)
+    return "\n".join(lines)
+
+
+def record_sell(chat_id, ticker_input: str, price: float) -> str:
+    """ปิดไม้: บันทึกแถวขาย แล้วสรุปผลของคู่ซื้อ-ขายทันที"""
+    open_trade = stock_core.get_open_trade(chat_id, ticker_input)
+    base = ticker_input.upper().replace(".BK", "")
+    if open_trade is None:
+        return (f"ไม่มีไม้ <b>{html.escape(base)}</b> ที่เปิดอยู่ครับ "
+                f"— บันทึกซื้อก่อน: <code>ซื้อ {html.escape(base)} ราคา</code>")
+    base = open_trade["symbol"]
+    stock_core.log_trade(chat_id, base, "sell", price,
+                         shares=open_trade["shares"])
+
+    buy = open_trade
+    pnl_pct = (price - buy["price"]) / buy["price"] * 100
+    held_days = (datetime.datetime.now(ZoneInfo("Asia/Bangkok")).date()
+                 - buy["datetime"].date()).days
+    emoji = "✅" if pnl_pct > 0 else "❌"
+    lines = [
+        f"{emoji} ปิดไม้ <b>{html.escape(base)}</b>: "
+        f"{buy['price']:,.2f} → {price:,.2f} = <b>{pnl_pct:+.1f}%</b> "
+        f"(ถือ {held_days} วัน)"
+    ]
+    if buy["shares"]:
+        pnl_baht = (price - buy["price"]) * buy["shares"]
+        lines.append(f"กำไร/ขาดทุน ~{pnl_baht:+,.0f} บ. ({buy['shares']:,} หุ้น)")
+    if buy["stop"] is not None and buy["price"] > buy["stop"]:
+        r_multiple = (price - buy["price"]) / (buy["price"] - buy["stop"])
+        lines.append(f"R-multiple: {r_multiple:+.1f}R "
+                     f"(เสี่ยง 1R = {buy['price'] - buy['stop']:,.2f} บ./หุ้น)")
+    lines.append("")
+    lines.append("ดูสถิติสะสม: <code>สถิติ</code> • ไม้ที่เหลือ: <code>เทรด</code>")
+    return "\n".join(lines)
+
+
+def build_trades_report(chat_id) -> str:
+    """คำสั่ง "เทรด": ไม้ที่เปิดอยู่ (พร้อมกำไรลอยตัว) + ไม้ปิดล่าสุด"""
+    rows = stock_core.load_trades(chat_id)
+    if not rows:
+        return ("ยังไม่เคยบันทึกไม้ครับ\n"
+                "ซื้อจริงเมื่อไหร่พิมพ์ <code>ซื้อ AOT 32.50</code> "
+                "(ใส่จำนวนหุ้นได้: <code>ซื้อ AOT 32.50 300</code>)\n"
+                "ขายแล้วพิมพ์ <code>ขาย AOT 35.00</code> — "
+                "สะสมไว้ให้ <code>สถิติ</code> เทียบผลจริงกับผลระบบ")
+    closed, open_ = stock_core.pair_trades(rows)
+    lines = []
+
+    if open_:
+        lines.append(f"📂 <b>ไม้ที่เปิดอยู่</b> ({len(open_)})")
+        for t in sorted(open_, key=lambda x: x["datetime"]):
+            try:
+                d = stock_core.get_stock_data(t["symbol"])
+            except Exception:
+                d = None
+            cur = f"ตอนนี้ {d['price']:,.2f} ({(d['price'] - t['price']) / t['price'] * 100:+.1f}%)" \
+                if d is not None else "ดึงราคาล่าสุดไม่ได้"
+            stop_txt = ""
+            if t["stop"] is not None:
+                stop_txt = f" ⛔ {t['stop']:,.2f}"
+                if d is not None and d["price"] <= t["stop"]:
+                    stop_txt += " — หลุดแล้ว!"
+            lines.append(
+                f"• <b>{html.escape(t['symbol'])}</b> "
+                f"ซื้อ {t['price']:,.2f} ({t['datetime']:%d/%m}) → {cur}{stop_txt}"
+            )
+        lines.append("")
+
+    if closed:
+        recent = sorted(closed, key=lambda p: p["sell"]["datetime"])[-10:]
+        lines.append(f"📁 <b>ไม้ที่ปิดแล้ว</b> (ล่าสุด {len(recent)}/{len(closed)})")
+        for p in reversed(recent):
+            b_, s_ = p["buy"], p["sell"]
+            pct = (s_["price"] - b_["price"]) / b_["price"] * 100
+            mark = "✅" if pct > 0 else "❌"
+            lines.append(
+                f"{mark} {html.escape(b_['symbol'])} "
+                f"{b_['price']:,.2f}→{s_['price']:,.2f} = {pct:+.1f}% "
+                f"({b_['datetime']:%d/%m}–{s_['datetime']:%d/%m})"
+            )
+        pcts = [(p["sell"]["price"] - p["buy"]["price"]) / p["buy"]["price"] * 100
+                for p in closed]
+        wins = sum(1 for x in pcts if x > 0)
+        lines.append("")
+        lines.append(f"รวม {len(closed)} ไม้: ชนะ {wins} ({wins / len(closed) * 100:.0f}%) "
+                     f"เฉลี่ย {sum(pcts) / len(pcts):+.1f}%")
+        lines.append("เทียบกับผลระบบ: <code>สถิติ</code>")
+    return "\n".join(lines)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _register_chat(update.effective_chat.id)
     text = update.message.text.strip()
@@ -1460,7 +1610,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "⏳ กำลังคำนวณสถิติจาก scan_log.csv (อาจใช้เวลาสักครู่)..."
         )
-        result = await asyncio.to_thread(stats.build_stats_report, True)
+        result = await asyncio.to_thread(
+            stats.build_stats_report, True, update.effective_chat.id
+        )
         await _reply_long(update.message, result, parse_mode="HTML")
         return
 
@@ -1468,6 +1620,67 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tickers and tickers[0].lower() in ("งบ", "earn", "earnings"):
         result = await asyncio.to_thread(handle_earnings_command, tickers)
         await update.message.reply_text(result, parse_mode="HTML")
+        return
+
+    # บันทึกไม้จริง: "ซื้อ AOT 32.50 [300]" / "ขาย AOT 35.00" / "เทรด"
+    if tickers and tickers[0].lower() in ("ซื้อ", "buy"):
+        if len(tickers) < 3:
+            await update.message.reply_text(
+                "พิมพ์ <code>ซื้อ AOT 32.50</code> "
+                "(ใส่จำนวนหุ้นได้: <code>ซื้อ AOT 32.50 300</code>)",
+                parse_mode="HTML",
+            )
+            return
+        try:
+            price = float(tickers[2].replace(",", ""))
+            if price <= 0:
+                raise ValueError
+            shares = None
+            if len(tickers) >= 4:
+                shares = int(tickers[3].replace(",", ""))
+                if shares <= 0:
+                    raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "รูปแบบ: <code>ซื้อ AOT 32.50</code> หรือ "
+                "<code>ซื้อ AOT 32.50 300</code> (ราคา แล้วค่อยจำนวนหุ้น)",
+                parse_mode="HTML",
+            )
+            return
+        await update.message.reply_text("⏳ กำลังบันทึกพร้อมเก็บบริบทระบบ...")
+        result = await asyncio.to_thread(
+            record_buy, update.effective_chat.id, tickers[1], price, shares
+        )
+        await update.message.reply_text(result, parse_mode="HTML")
+        return
+
+    if tickers and tickers[0].lower() in ("ขาย", "sell"):
+        if len(tickers) < 3:
+            await update.message.reply_text(
+                "พิมพ์ <code>ขาย AOT 35.00</code>", parse_mode="HTML"
+            )
+            return
+        try:
+            price = float(tickers[2].replace(",", ""))
+            if price <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "รูปแบบ: <code>ขาย AOT 35.00</code>", parse_mode="HTML"
+            )
+            return
+        result = await asyncio.to_thread(
+            record_sell, update.effective_chat.id, tickers[1], price
+        )
+        await update.message.reply_text(result, parse_mode="HTML")
+        return
+
+    if len(tickers) == 1 and tickers[0].lower() in ("เทรด", "trades"):
+        await update.message.reply_text("⏳ กำลังสรุปไม้...")
+        result = await asyncio.to_thread(
+            build_trades_report, update.effective_chat.id
+        )
+        await _reply_long(update.message, result, parse_mode="HTML")
         return
 
     # ตั้ง/ดูขนาดพอร์ต: "พอร์ต 500000" / "พอร์ต"

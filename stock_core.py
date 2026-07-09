@@ -422,6 +422,96 @@ def get_all_watched_symbols():
     return seen
 
 
+# ── บันทึกไม้จริง (trade journal) ───────────────────────────────
+# append-only เหมือน scan_log — แถวซื้อเก็บ "บริบท ณ ตอนเข้า" ไว้ด้วย
+# (วันงบ / เส้น ⛔ / คะแนน) เพราะพวกนี้คำนวณย้อนหลังไม่ได้ ต้องเก็บสด
+# ส่วนผลกำไร/R คำนวณตอนอ่านจากคู่ซื้อ-ขายเสมอ
+
+_TRADES_LOG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "trades_log.csv"
+)
+_TRADES_COLUMNS = ["datetime", "chat_id", "symbol", "side", "price",
+                   "shares", "earn_date", "stop", "score"]
+
+
+def log_trade(chat_id, symbol, side, price, shares=None,
+              earn_date=None, stop=None, score=None):
+    """ต่อท้าย trades_log.csv — side คือ 'buy' หรือ 'sell'"""
+    is_new = not os.path.exists(_TRADES_LOG_PATH)
+    with open(_TRADES_LOG_PATH, "a", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        if is_new:
+            w.writerow(_TRADES_COLUMNS)
+        w.writerow([
+            datetime.datetime.now(_BKK).strftime("%Y-%m-%d %H:%M"),
+            chat_id,
+            _base_symbol(symbol),
+            side,
+            f"{price:g}",
+            int(shares) if shares else "",
+            earn_date.isoformat() if earn_date else "",
+            f"{stop:g}" if stop is not None else "",
+            score if score is not None else "",
+        ])
+
+
+def load_trades(chat_id=None):
+    """อ่านทุกแถวจาก trades_log.csv (แถวเสียข้ามเงียบๆ ไฟล์ไม่มี = ลิสต์ว่าง)
+
+    chat_id=None คืนของทุก chat (ให้ stats.py รันเดี่ยวดูภาพรวม)"""
+    out = []
+    try:
+        with open(_TRADES_LOG_PATH, encoding="utf-8-sig") as f:
+            for r in csv.DictReader(f):
+                try:
+                    row = {
+                        "datetime": datetime.datetime.strptime(
+                            r["datetime"], "%Y-%m-%d %H:%M"),
+                        "chat_id": r["chat_id"],
+                        "symbol": r["symbol"],
+                        "side": r["side"],
+                        "price": float(r["price"]),
+                        "shares": int(r["shares"]) if r.get("shares") else None,
+                        "earn_date": datetime.date.fromisoformat(r["earn_date"])
+                        if r.get("earn_date") else None,
+                        "stop": float(r["stop"]) if r.get("stop") else None,
+                        "score": int(r["score"]) if r.get("score") else None,
+                    }
+                except (KeyError, ValueError, TypeError):
+                    continue
+                if chat_id is not None and row["chat_id"] != str(chat_id):
+                    continue
+                out.append(row)
+    except Exception:
+        return []
+    return out
+
+
+def pair_trades(rows):
+    """จับคู่ซื้อ→ขายตามลำดับเวลา ต่อ (chat, หุ้น) — เปิดได้ทีละหนึ่งไม้ต่อตัว
+
+    คืน (closed, open_) — closed = [{"buy": แถวซื้อ, "sell": แถวขาย}],
+    open_ = แถวซื้อที่ยังไม่มีขายจับคู่ (ซื้อซ้ำขณะไม้เปิด/ขายลอยๆ ถูกข้าม)"""
+    open_pos, closed = {}, []
+    for r in sorted(rows, key=lambda x: x["datetime"]):
+        key = (r["chat_id"], r["symbol"])
+        if r["side"] == "buy":
+            open_pos.setdefault(key, r)
+        elif r["side"] == "sell" and key in open_pos:
+            closed.append({"buy": open_pos.pop(key), "sell": r})
+    return closed, list(open_pos.values())
+
+
+def get_open_trade(chat_id, symbol):
+    """แถวซื้อของไม้ที่ยังเปิดอยู่ของ chat นี้ (None = ไม่มี)"""
+    base = _base_symbol(symbol)
+    _, open_ = pair_trades(load_trades(chat_id))
+    for r in open_:
+        if r["symbol"] == base:
+            return r
+    return None
+
+
 def get_watchers(symbol: str):
     """คืน list chat_id (str) ที่ติดตามหุ้นตัวนี้"""
     return [cid for cid, syms in _load_watchlists().items() if symbol in syms]

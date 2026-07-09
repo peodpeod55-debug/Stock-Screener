@@ -20,6 +20,7 @@ last_alive.json
 filings_log.csv
 digest_state.json
 port_settings.json
+trades_log.csv
 
 # ตั้งค่าเฉพาะเครื่อง
 .claude/
