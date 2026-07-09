@@ -275,7 +275,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• บอทเฝ้าข่าวให้เองทุก 10 นาที ช่วงเช้า/หลังปิดตลาด\n"
         "  เจอบริษัทแจ้งงบ → เตือนทันที + บันทึกวันงบอัตโนมัติ\n"
         "  พร้อมตัวเลขจาก F45 เช่น กำไร 120.5 ลบ. (+45% YoY)\n"
-        "• บอทส่งสรุปงบเช้าให้เองทุกวันทำการ 08:55 น.\n\n"
+        "• บอทส่งสรุปงบเช้าให้เองทุกวันทำการ 08:55 น.\n"
+        "• <code>ยืนยัน</code> — ตลาดตอบรับหุ้นงบโตแรงเมื่อคืนยังไง\n"
+        "  (gap + วอลุ่มเช้า) บอทส่งเองทุกวันทำการ 10:30 น.\n\n"
         "<b>สแกนหุ้นตอบรับงบดี</b>\n"
         "• <code>สแกน</code> — สแกนทั้งกระดานเดี๋ยวนี้ (~1-3 นาที)\n"
         "• อัตโนมัติทุกวันทำการ 17:30 น. บอทส่งผลให้เอง\n"
@@ -285,8 +287,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  ผ่านไป 5/10/20 วัน ชนะกี่ % เฉลี่ยกี่ %\n\n"
         "ทุกคำสั่งพิมพ์เป็นอังกฤษได้ (ตัวเล็ก-ใหญ่ไม่สำคัญ):\n"
         "<code>scan</code> / <code>news</code> / <code>digest</code> / "
-        "<code>stats</code> / <code>earn AOT</code> / <code>watch AOT</code> / "
-        "<code>unwatch AOT</code> / <code>list</code>",
+        "<code>confirm</code> / <code>stats</code> / <code>earn AOT</code> / "
+        "<code>watch AOT</code> / <code>unwatch AOT</code> / <code>list</code>",
         parse_mode="HTML",
     )
 
@@ -321,6 +323,7 @@ SCAN_HOUR, SCAN_MINUTE = 17, 30      # เวลาสแกนอัตโน�
 REMIND_HOUR, REMIND_MINUTE = 8, 45   # เวลาเตือนวันงบตอนเช้า
 HEART_HOUR, HEART_MINUTE = 8, 30     # เวลาส่ง heartbeat เช้า
 DIGEST_HOUR, DIGEST_MINUTE = 8, 55   # เวลาส่งสรุปงบเช้า
+CONFIRM_HOUR, CONFIRM_MINUTE = 10, 30  # เวลารายงานยืนยันรอบเช้า (ครึ่งชม.แรกหลังเปิด)
 MONITOR_INTERVAL_MIN = 15            # เช็คลิสต์ติดตามทุกกี่นาที (ช่วงตลาดเปิด)
 NEWS_POLL_MINUTES = 10               # เช็คข่าวแจ้งงบจากเว็บ SET ทุกกี่นาที
 
@@ -737,6 +740,171 @@ async def startup_digest_job(context: ContextTypes.DEFAULT_TYPE):
     await _run_morning_digest(context, "startup morning digest")
 
 
+# ── ยืนยันรอบเช้า (10:30): ตลาดตอบรับหุ้นงบโตแรงเมื่อคืนยังไง ───
+# ปิด loop ของ workflow "เย็นเก็บโจทย์ → เช้ายืนยัน": เอาหุ้นงบโตแรง
+# ตั้งแต่เย็นวาน (earnings_results.csv) มาดูราคา/วอลุ่มครึ่งชั่วโมงแรก
+# แล้วแบ่ง ✅ ตลาดยืนยัน / 😐 ยังไม่ชัด / ❌ เปิดนิ่ง-ลบ = ตัดทิ้งตามกติกา
+# (ราคา Yahoo delay ~15 นาที — 10:30 คือจุดแรกที่เห็นภาพครึ่งชม.แรกจริง)
+
+CONFIRM_STRONG_CHG = 2.0   # วันนี้วิ่ง ≥ นี้ (%) = ตลาดตอบรับชัด
+CONFIRM_FLAT_CHG = 0.5     # วิ่งไม่เกินนี้ (%) = เปิดนิ่ง/ลบ → ตัดทิ้ง
+CONFIRM_VOL_RATIO = 0.5    # วอลุ่มสะสมเช้า ≥ ครึ่งของเฉลี่ยทั้งวัน 20 วัน = หนา
+CONFIRM_MAX_SYMBOLS = 15   # เพดานตัวที่ดึงราคา (เท่า limit ปุ่ม ➕)
+
+
+def build_morning_confirm(now: datetime.datetime = None):
+    """รายงานยืนยันรอบเช้า — ยิง Yahoo เฉพาะตัวงบโตแรง (สูงสุด CONFIRM_MAX_SYMBOLS)
+
+    คืน (ข้อความ, รายชื่อกลุ่ม ✅ ที่ยังไม่มีใครเฝ้า — ไว้ทำปุ่ม ➕)
+    หรือ ("", []) ถ้าไม่มีหุ้นงบโตแรงตั้งแต่เย็นวาน"""
+    if now is None:
+        now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
+    since_dt = _digest_window_start(now)
+    results = set_news.load_results_since(since_dt)
+
+    # เฉพาะงวดล่าสุดของแต่ละ symbol (กันซ้ำ) แล้วคัดเฉพาะงบโตแรง
+    latest = {}
+    for r in results:
+        cur = latest.get(r["symbol"])
+        if cur is None or r["news_datetime"] > cur["news_datetime"]:
+            latest[r["symbol"]] = r
+    strong = [r for r in latest.values() if set_news.f45_is_strong({
+        "profit_cur": r["profit_mb"] * 1e6,
+        "profit_prior": r["profit_prior_mb"] * 1e6,
+    })]
+    if not strong:
+        return "", []
+
+    # เรียงพลิกกำไรก่อน ตามด้วย %YoY (ลำดับเดียวกับสรุปงบเช้า) — เกินเพดานตัดท้าย
+    def sort_key(r):
+        flipped = r["profit_prior_mb"] <= 0
+        return (0 if flipped else 1,
+                -r["profit_mb"] if flipped else 0,
+                -(r["yoy_pct"] if r["yoy_pct"] is not None else float("-inf")))
+
+    strong.sort(key=sort_key)
+    dropped = max(0, len(strong) - CONFIRM_MAX_SYMBOLS)
+    strong = strong[:CONFIRM_MAX_SYMBOLS]
+
+    confirmed, unclear, rejected, failed = [], [], [], []
+    for r in strong:
+        try:
+            d = stock_core.get_stock_data(r["symbol"])
+        except Exception:
+            d = None
+        if d is None or d["day_change_pct"] is None:
+            failed.append(r["symbol"])
+            continue
+        chg = d["day_change_pct"]
+        vr = d["vol_ratio"] or 0
+        if chg >= CONFIRM_STRONG_CHG and vr >= CONFIRM_VOL_RATIO:
+            confirmed.append((r, d))
+        elif chg <= CONFIRM_FLAT_CHG:
+            rejected.append((r, d))
+        else:
+            unclear.append((r, d))
+
+    idx = 0
+
+    def fmt(r, d):
+        nonlocal idx
+        idx += 1
+        return (f"{idx}. <b>{html.escape(r['symbol'])}</b>  "
+                f"{format_signed_pct(d['day_change_pct'])} วันนี้ "
+                f"(gap {format_signed_pct(d['gap_pct'])}, วอล {d['vol_ratio'] or 0:.1f}x)\n"
+                f"    {html.escape(r['summary'])}")
+
+    weekday_th = _THAI_WEEKDAY[now.weekday()]
+    lines = [
+        f"☀️ <b>ยืนยันรอบเช้า</b> — {weekday_th} {now:%d/%m %H:%M} "
+        f"(งบโตแรงตั้งแต่เย็นวาน {len(strong) + dropped} ตัว)",
+        "วอล = วอลุ่มสะสมวันนี้เทียบเฉลี่ยทั้งวัน 20 วัน",
+        "",
+    ]
+    if confirmed:
+        lines.append(f"✅ <b>ตลาดยืนยัน — เปิดวิ่งพร้อมวอลุ่ม</b> ({len(confirmed)})")
+        lines += [fmt(r, d) for r, d in confirmed]
+        lines.append("")
+    if unclear:
+        lines.append(f"😐 <b>ยังไม่ชัด — บวกแต่ไม่แรง/วอลุ่มเบา</b> ({len(unclear)})")
+        lines += [fmt(r, d) for r, d in unclear]
+        lines.append("")
+    if rejected:
+        lines.append(f"❌ <b>เปิดนิ่ง/ลบทั้งที่งบดี — ตัดทิ้งตามกติกา</b> ({len(rejected)})")
+        lines += [fmt(r, d) for r, d in rejected]
+        lines.append("")
+    if failed:
+        lines.append("⚠️ ดึงราคาไม่ได้: " +
+                      ", ".join(html.escape(s) for s in failed))
+        lines.append("")
+    if dropped:
+        lines.append(f"(แสดง {len(strong)} ตัวแรก — โตแรงทั้งหมด {len(strong) + dropped} ตัว "
+                      f"ที่เหลือดูใน <code>สรุปงบ</code>)")
+        lines.append("")
+    lines.append("จุดเข้าตามกติกา: รอปิดวัน ≥+2.5% วอล ≥2x "
+                 "หรือทะลุไฮ 3 ด. (เฝ้าให้เด้ง 🔥: กด ➕ / <code>ติดตาม XXX</code>)")
+
+    watch = set(stock_core.get_all_watched_symbols())
+    hot = [r["symbol"] for r, _ in confirmed if r["symbol"] not in watch]
+    return "\n".join(lines), hot
+
+
+# กันส่งซ้ำแบบเดียวกับสรุปงบเช้า: job 10:30 กับ startup fallback
+# ใช้ digest_state.json ร่วมกัน (คนละ key) + ธง in-flight
+_confirm_in_flight = False
+
+
+async def _run_morning_confirm(context: ContextTypes.DEFAULT_TYPE, label: str):
+    """ตัวส่งยืนยันรอบเช้ากลาง: ส่งครั้งเดียวต่อวัน — ไม่มีตัวโตแรง = เงียบ"""
+    global _confirm_in_flight
+    now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
+    if now.weekday() >= 5 or _is_market_holiday(now.date()):
+        return
+    if _confirm_in_flight:
+        return
+    if _load_digest_state().get("confirm_last_sent") == now.date().isoformat():
+        return
+    chat_ids = _load_chat_ids()
+    if not chat_ids:
+        return
+    _confirm_in_flight = True
+    try:
+        try:
+            text, hot = await asyncio.to_thread(build_morning_confirm, now)
+        except Exception:
+            log.exception("%s failed", label)
+            return
+        if not text:
+            return
+        buttons = _watch_buttons(hot)
+        for cid in chat_ids:
+            try:
+                await _send_long(context.bot, cid, text,
+                                 reply_markup=buttons, parse_mode="HTML")
+            except Exception:
+                log.exception("send %s failed (chat %s)", label, cid)
+        state = _load_digest_state()
+        state["confirm_last_sent"] = now.date().isoformat()
+        _save_digest_state(state)
+    finally:
+        _confirm_in_flight = False
+
+
+async def morning_confirm_job(context: ContextTypes.DEFAULT_TYPE):
+    """job รายวัน 10:30: ยืนยันรอบเช้า"""
+    await _run_morning_confirm(context, "morning confirm")
+
+
+async def startup_confirm_job(context: ContextTypes.DEFAULT_TYPE):
+    """ตอนเปิดบอท: ถ้าเลย 10:30 แต่ยังไม่เที่ยง และวันนี้ยังไม่ได้ส่ง → ส่งเลย
+    (เกินเที่ยงภาพ "ครึ่งชั่วโมงแรก" หมดความหมายแล้ว — เรียกเองได้ด้วย ยืนยัน)"""
+    now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
+    if not (datetime.time(CONFIRM_HOUR, CONFIRM_MINUTE)
+            <= now.time() < datetime.time(12, 0)):
+        return
+    await _run_morning_confirm(context, "startup morning confirm")
+
+
 # ── แจ้งเตือนเมื่อสถานะหุ้นในลิสต์เปลี่ยน (เช็คช่วงตลาดเปิด) ────
 # จำสถานะรอบก่อนไว้ใน watch_state.json แล้ว push เฉพาะตอนเปลี่ยน:
 # หลุด Low ก่อนงบ (จุดตัดขาดทุน) / ทะลุไฮ 3 เดือน / ผ่านไฮ 5 วัน
@@ -1151,6 +1319,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                           reply_markup=_watch_buttons(hot), parse_mode="HTML")
         return
 
+    # ยืนยันรอบเช้า: "ยืนยัน" — ตลาดตอบรับหุ้นงบโตแรงเมื่อคืนยังไง
+    if len(tickers) == 1 and tickers[0].lower() in ("ยืนยัน", "confirm"):
+        await update.message.reply_text(
+            "⏳ กำลังเช็คราคาหุ้นงบโตแรงตั้งแต่เย็นวาน..."
+        )
+        text, hot = await asyncio.to_thread(build_morning_confirm)
+        if not text:
+            await update.message.reply_text(
+                "📭 ไม่มีหุ้นงบโตแรง (+30% YoY / พลิกเป็นกำไร) "
+                "ตั้งแต่เย็นวานครับ — ดูทั้งหมด: <code>สรุปงบ</code>",
+                parse_mode="HTML",
+            )
+            return
+        await _reply_long(update.message, text,
+                          reply_markup=_watch_buttons(hot), parse_mode="HTML")
+        return
+
     # สถิติย้อนหลังจาก scan_log.csv: "สถิติ"
     if len(tickers) == 1 and tickers[0].lower() in ("สถิติ", "stats"):
         await update.message.reply_text(
@@ -1251,7 +1436,9 @@ def main():
     print(f"  เฝ้าข่าวแจ้งงบ (เว็บ SET) ทุก {NEWS_POLL_MINUTES} นาที "
           "ช่วง 07:00-09:45 และ 17:00-21:45")
     print(f"  สรุปงบเช้าทุกวันทำการ เวลา {DIGEST_HOUR:02d}:{DIGEST_MINUTE:02d} น. "
-          "(หรือส่งตอนเปิดบอทถ้ายังไม่ได้ส่ง)\n")
+          "(หรือส่งตอนเปิดบอทถ้ายังไม่ได้ส่ง)")
+    print(f"  ยืนยันรอบเช้าทุกวันทำการ เวลา {CONFIRM_HOUR:02d}:{CONFIRM_MINUTE:02d} น. "
+          "(เฉพาะวันที่มีหุ้นงบโตแรง)\n")
     log.info("bot starting")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1284,12 +1471,19 @@ def main():
         morning_digest_job,
         time=datetime.time(DIGEST_HOUR, DIGEST_MINUTE, tzinfo=ZoneInfo("Asia/Bangkok")),
     )
+    app.job_queue.run_daily(
+        morning_confirm_job,
+        time=datetime.time(CONFIRM_HOUR, CONFIRM_MINUTE,
+                           tzinfo=ZoneInfo("Asia/Bangkok")),
+    )
     # จดเวลาว่ายังทำงานทุก 5 นาที + เก็บตกข่าวช่วงที่ปิดไป (ครั้งเดียวตอนเปิด)
     app.job_queue.run_repeating(alive_job, interval=300, first=10)
     app.job_queue.run_once(startup_catchup_job, when=20)
     # startup digest หน่วง 300 วิ ให้ catch-up (วินาที 20) + news poll รอบแรก
     # (วินาที 120) ทำงานจบก่อน ข้อมูลเช้านี้จะได้อยู่ใน CSV แล้ว
     app.job_queue.run_once(startup_digest_job, when=300)
+    # ยืนยันรอบเช้าตามหลัง digest (เผื่อเปิดคอมหลัง 10:30 — เงื่อนไขเวลาอยู่ใน job)
+    app.job_queue.run_once(startup_confirm_job, when=330)
     # ย้าย watchlist.json format เดิม (list) → per-user dict ให้เจ้าของ (ครั้งเดียว)
     stock_core.migrate_legacy_watchlist(_load_chat_ids())
     app.run_polling(drop_pending_updates=True)
