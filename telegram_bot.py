@@ -264,7 +264,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>ติดตามหุ้นหลังงบ</b>\n"
         "• <code>ติดตาม AOT</code> — เพิ่มเข้าลิสต์ (หรือกดปุ่ม ➕ ใต้ผลสแกน)\n"
         "• <code>ลิสต์</code> — จัดอันดับตามคะแนนสัญญาณหลังงบ\n"
-        "• <code>เลิกติดตาม AOT</code> — เอาออกจากลิสต์\n"
+        "• <code>เลิกติดตาม AOT</code> — เอาออกจากลิสต์ (หลายตัวพร้อมกันได้)\n"
         "• บอทเช็คลิสต์ให้เองช่วงตลาดเปิด แจ้งทันทีเมื่อ\n"
         "  ทะลุไฮ 3 ด. / ผ่านไฮ 5 วัน / ทำไฮใหม่ / ⛔ หลุด Low ก่อนงบ\n"
         "• เตือนตอนเช้าถ้าหุ้นในลิสต์งบออกวันนี้/พรุ่งนี้\n\n"
@@ -282,7 +282,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• ผลบันทึกลง scan_log.csv ไว้เปิดดูใน Excel\n\n"
         "<b>สถิติย้อนหลัง</b>\n"
         "• <code>สถิติ</code> — หุ้นติดสแกนแต่ละช่วงคะแนน\n"
-        "  ผ่านไป 5/10/20 วัน ชนะกี่ % เฉลี่ยกี่ %",
+        "  ผ่านไป 5/10/20 วัน ชนะกี่ % เฉลี่ยกี่ %\n\n"
+        "ทุกคำสั่งพิมพ์เป็นอังกฤษได้ (ตัวเล็ก-ใหญ่ไม่สำคัญ):\n"
+        "<code>scan</code> / <code>news</code> / <code>digest</code> / "
+        "<code>stats</code> / <code>earn AOT</code> / <code>watch AOT</code> / "
+        "<code>unwatch AOT</code> / <code>list</code>",
         parse_mode="HTML",
     )
 
@@ -450,7 +454,26 @@ def build_news_alert_text(hits) -> str:
     return "\n".join(lines)
 
 
+# ── watchdog: ดึงข่าว SET ล้มติดต่อกันต้องไม่เงียบ ──────────────
+# ล้มครั้งเดียวเป็นเรื่องปกติ (เน็ตสะดุด/เว็บช้า) แต่ล้มติดกันหลายรอบ
+# ช่วงฤดูงบ = กำลังพลาดข่าวโดยไม่รู้ตัว — เด้งเตือนครั้งเดียวต่อการล่ม
+# หนึ่งช่วง แล้วแจ้งอีกทีตอนกลับมาดึงได้ (นับใน memory — รีสตาร์ทบอท
+# แล้วเริ่มนับใหม่ ซึ่งโอเค เพราะรีสตาร์ทคือความพยายามแก้อยู่แล้ว)
+_NEWS_FAIL_ALERT_AFTER = 3   # 3 รอบ x 10 นาที ≈ ล่มต่อเนื่องครึ่งชั่วโมง
+_news_fail_count = 0
+_news_fail_alerted = False
+
+
+async def _broadcast(bot, chat_ids, text: str):
+    for cid in chat_ids:
+        try:
+            await bot.send_message(cid, text, parse_mode="HTML")
+        except Exception:
+            log.exception("broadcast failed (chat %s)", cid)
+
+
 async def news_monitor_job(context: ContextTypes.DEFAULT_TYPE):
+    global _news_fail_count, _news_fail_alerted
     now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
     if now.weekday() >= 5 or _is_market_holiday(now.date()):
         return
@@ -463,7 +486,24 @@ async def news_monitor_job(context: ContextTypes.DEFAULT_TYPE):
         hits = await asyncio.to_thread(set_news.check_new_earnings_news)
     except Exception:
         log.exception("SET news poll failed")
+        _news_fail_count += 1
+        if _news_fail_count >= _NEWS_FAIL_ALERT_AFTER and not _news_fail_alerted:
+            _news_fail_alerted = True
+            await _broadcast(
+                context.bot, chat_ids,
+                f"⚠️ <b>ดึงข่าวจากเว็บ SET ล้มเหลวติดต่อกัน {_news_fail_count} รอบ</b> "
+                f"(~{_news_fail_count * 10} นาที)\n"
+                "ช่วงนี้อาจพลาดข่าวแจ้งงบ — สาเหตุที่พบบ่อย: เน็ตมีปัญหา "
+                "หรือเว็บ SET เปลี่ยนโครงสร้าง\n"
+                "เช็คอาการได้ด้วยการรัน <code>python set_news.py</code> ที่เครื่องบอท\n"
+                "ถ้ากลับมาดึงได้ปกติจะแจ้งให้ทราบอีกครั้ง",
+            )
         return
+    if _news_fail_alerted:
+        await _broadcast(context.bot, chat_ids,
+                         "✅ ดึงข่าวจากเว็บ SET กลับมาทำงานปกติแล้ว")
+    _news_fail_count = 0
+    _news_fail_alerted = False
     if not hits:
         return
     text = build_news_alert_text(hits)
@@ -1121,13 +1161,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # คำสั่งจัดการวันประกาศงบ: "งบ AOT" / "งบ AOT 13/11/2569"
-    if tickers and tickers[0] in ("งบ", "earn", "earnings"):
+    if tickers and tickers[0].lower() in ("งบ", "earn", "earnings"):
         result = await asyncio.to_thread(handle_earnings_command, tickers)
         await update.message.reply_text(result, parse_mode="HTML")
         return
 
     # watchlist: "ติดตาม AOT" / "เลิกติดตาม AOT" / "ลิสต์"
-    if tickers and tickers[0] in ("ติดตาม", "watch"):
+    if tickers and tickers[0].lower() in ("ติดตาม", "watch"):
         if len(tickers) < 2:
             await update.message.reply_text("พิมพ์ <code>ติดตาม AOT</code>", parse_mode="HTML")
             return
@@ -1142,20 +1182,33 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if tickers and tickers[0] in ("เลิกติดตาม", "ถอน", "unwatch"):
+    if tickers and tickers[0].lower() in ("เลิกติดตาม", "ถอน", "unwatch"):
         if len(tickers) < 2:
-            await update.message.reply_text("พิมพ์ <code>เลิกติดตาม AOT</code>", parse_mode="HTML")
-            return
-        removed, remaining = stock_core.remove_from_watchlist(
-            tickers[1], update.effective_chat.id
-        )
-        if removed:
             await update.message.reply_text(
-                f"🗑 เอา <b>{html.escape(removed)}</b> ออกจากลิสต์แล้ว (เหลือ {len(remaining)} ตัว)",
+                "พิมพ์ <code>เลิกติดตาม AOT</code> "
+                "(หลายตัวพร้อมกันได้: <code>เลิกติดตาม AOT PTT</code>)",
                 parse_mode="HTML",
             )
-        else:
-            await update.message.reply_text("ไม่พบตัวนี้ในลิสต์ครับ")
+            return
+        removed, not_found = [], []
+        remaining = stock_core.get_watchlist(update.effective_chat.id)
+        for t in tickers[1:]:
+            base, remaining = stock_core.remove_from_watchlist(
+                t, update.effective_chat.id
+            )
+            if base:
+                removed.append(base)
+            else:
+                not_found.append(t.upper())
+        lines = []
+        if removed:
+            lines.append(
+                f"🗑 เอาออกจากลิสต์แล้ว: <b>{html.escape(' '.join(removed))}</b> "
+                f"(เหลือ {len(remaining)} ตัว)"
+            )
+        if not_found:
+            lines.append(f"ไม่พบในลิสต์: {html.escape(' '.join(not_found))}")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
         return
 
     if len(tickers) == 1 and tickers[0].lower() in ("ลิสต์", "list", "watchlist"):
