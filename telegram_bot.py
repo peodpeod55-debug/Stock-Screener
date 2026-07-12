@@ -1054,25 +1054,61 @@ def build_earnings_reminder(chat_id):
     return "🗓 <b>เตือนวันประกาศงบ (หุ้นในลิสต์)</b>\n" + "\n".join(soon)
 
 
-async def earnings_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+# กันส่งซ้ำแบบเดียวกับสรุปงบเช้า: job 08:45 กับ startup fallback
+# ใช้ digest_state.json ร่วมกัน (key "remind_last_sent") + ธง in-flight
+_remind_in_flight = False
+
+
+async def _run_earnings_reminder(context: ContextTypes.DEFAULT_TYPE, label: str):
+    """ตัวส่งเตือนวันงบกลาง: ส่งครั้งเดียวต่อวัน — ไม่มีตัวงบใกล้ = ไม่ส่ง
+    ไม่บันทึกสถานะ (ให้ trigger ถัดไปของวันลองใหม่ได้ ไม่มีผลข้างเคียง)"""
+    global _remind_in_flight
     now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
     if now.weekday() >= 5:
+        return
+    if _remind_in_flight:
+        return
+    if _load_digest_state().get("remind_last_sent") == now.date().isoformat():
         return
     chat_ids = _load_chat_ids()
     if not chat_ids:
         return
-    for cid in chat_ids:
-        try:
-            text = await asyncio.to_thread(build_earnings_reminder, cid)
-        except Exception:
-            log.exception("earnings reminder failed (chat %s)", cid)
-            continue
-        if not text:
-            continue
-        try:
-            await context.bot.send_message(cid, text, parse_mode="HTML")
-        except Exception:
-            log.exception("send reminder failed (chat %s)", cid)
+    _remind_in_flight = True
+    try:
+        sent_any = False
+        for cid in chat_ids:
+            try:
+                text = await asyncio.to_thread(build_earnings_reminder, cid)
+            except Exception:
+                log.exception("%s failed (chat %s)", label, cid)
+                continue
+            if not text:
+                continue
+            try:
+                await context.bot.send_message(cid, text, parse_mode="HTML")
+                sent_any = True
+            except Exception:
+                log.exception("send %s failed (chat %s)", label, cid)
+        if sent_any:
+            state = _load_digest_state()
+            state["remind_last_sent"] = now.date().isoformat()
+            _save_digest_state(state)
+    finally:
+        _remind_in_flight = False
+
+
+async def earnings_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    """job รายวัน 08:45: เตือนหุ้นในลิสต์ที่งบออกวันนี้/พรุ่งนี้"""
+    await _run_earnings_reminder(context, "earnings reminder")
+
+
+async def startup_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    """ตอนเปิดบอท: ถ้าวันนี้ยังไม่ได้ส่งเตือนวันงบ และยังไม่สายเกิน 16:30
+    → ส่งเลย (รองรับเปิดคอมสาย ~09:30 เกินเวลา job 08:45 ไปแล้ว)"""
+    now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
+    if now.time() >= datetime.time(16, 30):
+        return
+    await _run_earnings_reminder(context, "startup earnings reminder")
 
 
 # ── ปุ่ม "➕ ติดตาม" ใต้ผลสแกน/สรุปงบ (กดแล้วเข้าลิสต์ทันที) ─────
@@ -1953,6 +1989,9 @@ def main():
     app.job_queue.run_once(startup_digest_job, when=300)
     # ยืนยันรอบเช้าตามหลัง digest (เผื่อเปิดคอมหลัง 10:30 — เงื่อนไขเวลาอยู่ใน job)
     app.job_queue.run_once(startup_confirm_job, when=330)
+    # เตือนวันงบตามหลังอีกขั้น (เผื่อเปิดคอมหลัง 08:45 — ยิง Yahoo ทีละตัวในลิสต์
+    # จึงให้ job อื่นที่รีบกว่าไปก่อน)
+    app.job_queue.run_once(startup_reminder_job, when=360)
     # ย้าย watchlist.json format เดิม (list) → per-user dict ให้เจ้าของ (ครั้งเดียว)
     stock_core.migrate_legacy_watchlist(_load_chat_ids())
     app.run_polling(drop_pending_updates=True)

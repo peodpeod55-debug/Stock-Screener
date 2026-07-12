@@ -53,7 +53,7 @@ backtest.py           ← จำลองระบบคะแนนกับว
 |---|---|
 | 07:00-09:45 และ 17:00-21:45 ทุก 10 นาที | poll ข่าวแจ้งงบจากเว็บ SET |
 | 08:30 | heartbeat "✅ บอททำงานปกติ" |
-| 08:45 | เตือนหุ้นใน watchlist ที่งบออกวันนี้/พรุ่งนี้ |
+| 08:45 | เตือนหุ้นใน watchlist ที่งบออกวันนี้/พรุ่งนี้ — มี startup fallback (หน่วง 360 วิ, ก่อน 16:30) แบบเดียวกับสรุปงบเช้า |
 | 08:55 | สรุปงบเช้า — รวบหุ้นแจ้งงบตั้งแต่เย็นวาน+เช้านี้เป็นข้อความเดียว |
 | 10:30 | ยืนยันรอบเช้า — หุ้นงบโตแรงเมื่อคืน แบ่ง ✅ ตลาดยืนยัน / 😐 / ❌ ตัดทิ้ง ตาม %วันนี้+วอลุ่มสะสม (ไม่มีตัวโตแรง = ไม่ส่ง) |
 | 10:00-17:00 ทุก 15 นาที | เช็ค watchlist — เด้งเฉพาะตอนสถานะเปลี่ยน (🔥 ทะลุไฮ 3 ด. / 📈 ไฮใหม่ / ⛔ หลุด Low ก่อนงบ) |
@@ -86,7 +86,7 @@ backtest.py           ← จำลองระบบคะแนนกับว
 
 ## ไฟล์ข้อมูล/สถานะ (gitignore ทั้งหมด — อย่า commit)
 
-`.env` (BOT_TOKEN), `watchlist.json`, `chat_ids.json`, `news_seen.json`, `last_alive.json`, `watch_state.json`, `scan_log.csv`, `lookup_log.csv`, `backtest_results.csv`, `bot_log.txt`, `.yf_cache/`, `filings_log.csv` (ใครแจ้งงบเมื่อไหร่ — ดิบกว่า earnings_results.csv รวมตัวที่อ่านตัวเลขไม่ได้ด้วย), `digest_state.json` (กันส่งสรุปงบเช้า/ยืนยันรอบเช้าซ้ำในวันเดียว — key `last_sent` / `confirm_last_sent`), `port_settings.json` (ขนาดพอร์ตต่อ chat สำหรับคำนวณขนาดไม้), `trades_log.csv` (บันทึกไม้จริง — append-only เหมือน scan_log)
+`.env` (BOT_TOKEN), `watchlist.json`, `chat_ids.json`, `news_seen.json`, `last_alive.json`, `watch_state.json`, `scan_log.csv`, `lookup_log.csv`, `backtest_results.csv`, `bot_log.txt`, `.yf_cache/`, `filings_log.csv` (ใครแจ้งงบเมื่อไหร่ — ดิบกว่า earnings_results.csv รวมตัวที่อ่านตัวเลขไม่ได้ด้วย), `digest_state.json` (กันส่งสรุปงบเช้า/ยืนยันรอบเช้า/เตือนวันงบซ้ำในวันเดียว — key `last_sent` / `confirm_last_sent` / `remind_last_sent`), `port_settings.json` (ขนาดพอร์ตต่อ chat สำหรับคำนวณขนาดไม้), `trades_log.csv` (บันทึกไม้จริง — append-only เหมือน scan_log)
 
 ไฟล์ log แบบ append (scan_log, lookup_log) คือข้อมูลสะสมที่ใช้วิเคราะห์ย้อนหลัง — เปลี่ยน schema คอลัมน์ต้องระวังไฟล์เก่าที่มีอยู่
 
