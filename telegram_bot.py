@@ -355,22 +355,20 @@ def _write_alive():
         pass
 
 
-def _read_alive():
-    try:
-        with open(_ALIVE_PATH, encoding="utf-8") as f:
-            return datetime.datetime.fromisoformat(json.load(f)["ts"])
-    except Exception:
-        return None
+def _catchup_days(news_age_h):
+    """ควรเก็บตกข่าวย้อนกี่วัน — None ถ้าไม่ต้อง (ข้อมูลข่าวยังสดพอ)
 
-
-def _catchup_days(last_alive, now):
-    """ควรเก็บตกข่าวย้อนกี่วัน — None ถ้าไม่ต้อง (เพิ่งปิดไปไม่นาน)"""
-    if last_alive is None:
-        return None  # เพิ่งใช้ครั้งแรก ไม่มีช่วงที่หายไป
-    gap_h = (now - last_alive).total_seconds() / 3600
-    if gap_h < CATCHUP_MIN_GAP_HOURS:
+    ตัดสินจากอายุข้อมูลข่าว (news_seen.json) โดยตรง — เดิมดูจาก last_alive
+    แต่โดน alive_job เขียนทับก่อน catch-up อ่าน (heartbeat รันวินาทีที่ 10
+    catch-up รันวินาทีที่ 20) ทำให้ catch-up ไม่เคยทำงานจริง อีกทั้งสิ่งที่
+    catch-up ต้องเติมคือ "ข่าวที่ขาด" อายุข่าวจึงเป็นตัววัดที่ตรงกว่า
+    (โบนัส: รอบก่อน catch-up ล้มเหลว รีสตาร์ทใหม่จะลองซ้ำให้เอง)
+    """
+    if news_age_h is None:
+        return None  # เพิ่งใช้ครั้งแรก ยังไม่มีฐานข่าวให้เติม
+    if news_age_h < CATCHUP_MIN_GAP_HOURS:
         return None
-    return min(CATCHUP_MAX_DAYS, int(gap_h // 24) + 1)
+    return min(CATCHUP_MAX_DAYS, int(news_age_h // 24) + 1)
 
 
 async def alive_job(context: ContextTypes.DEFAULT_TYPE):
@@ -380,8 +378,7 @@ async def alive_job(context: ContextTypes.DEFAULT_TYPE):
 async def startup_catchup_job(context: ContextTypes.DEFAULT_TYPE):
     """รันครั้งเดียวตอนบอทเปิด: ถ้าหายไปนาน ให้ดึงข่าวย้อนช่วงที่หาย
     มาบันทึกวันงบ/ตัวเลข F45 ให้ครบ (ข่าวเก่าบันทึกเงียบๆ ไม่สแปม)"""
-    now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
-    days = _catchup_days(_read_alive(), now)
+    days = _catchup_days(set_news.news_data_age_hours())
     _write_alive()
     if days is None:
         return
