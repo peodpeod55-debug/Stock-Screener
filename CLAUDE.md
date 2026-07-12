@@ -76,10 +76,13 @@ backtest.py           ← จำลองระบบคะแนนกับว
 - `check_new_earnings_news()` นอกจากบันทึกวันงบ/ตัวเลข F45 แล้ว ยังต่อท้าย `filings_log.csv` (ทุกข่าวงบที่ยังไม่เคยเห็น — ดิบกว่า `earnings_results.csv` เพราะเก็บแม้ตัวที่อ่านตัวเลขไม่ได้) ใช้เป็นแหล่งข้อมูลของ "สรุปงบเช้า"
 - `load_results_since(dt)` / `load_filings_since(dt)` อ่านย้อนหลังจาก CSV ล้วนๆ (ไม่ยิง Playwright) ให้ `build_morning_digest` ใน telegram_bot.py — ไฟล์ไม่มี/แถวเสียต้องคืนค่าว่าง ห้ามโยน exception
 
-### scanner.py — สองโหมด
+### scanner.py — สามโหมด (เลือกอัตโนมัติผ่าน `run_best_scan` ใน telegram_bot)
 
-1. โหมด universe: รายชื่อใน `scan_universe.txt` (~94 ตัว) ยิง Yahoo ทีละตัว
-2. โหมดทั้งตลาด: คัดหยาบจาก parquet cache ของโปรเจกต์ Trading_Dashboard (~883 ตัว ไม่ยิง Yahoo) แล้วยืนยันเฉพาะตัวที่เข้าเกณฑ์ด้วยข้อมูลสด — ถ้าข้อมูล dashboard เก่าเกิน 5 วันจะ fallback เป็นโหมดแรก path ของ cache ตั้งผ่าน env var `DASHBOARD_TH_CACHE` ใน `.env` (เว้นว่าง = ข้ามโหมดนี้ ใช้โหมดรายชื่อหลักแทน)
+1. **โหมดข่าวแจ้งงบ (`run_filings_scan` — โหมดหลัก ตั้งแต่ 2026-07-12):** candidate = บริษัทที่แจ้งงบใน 7 วัน จาก `filings_log.csv` + `stock_core.symbols_with_recent_earnings()` (คลังวันงบ รวมที่ผู้ใช้บันทึกเองผ่านคำสั่ง "งบ") แล้วยืนยันทุกตัวด้วยข้อมูลสดจาก Yahoo ตามเกณฑ์เดิม — ครอบคลุมทุกบริษัทที่แจ้งงบจริง ไม่พึ่งความสดของ parquet และประหยัด request มหาศาล (แนวเดิมไล่หาราคาพุ่งทั้งตลาดแล้วยิง Yahoo พิสูจน์ว่า "ไม่เกี่ยวกับงบ" ทีละตัว ~83% ของ candidate ช่วงนอกฤดูงบ) ถ้ามี parquet จะใช้ `_parquet_prefilter` ช่วยคัดหยาบ — กติกาความปลอดภัย: ตัด candidate ได้เฉพาะเมื่อ parquet ครอบ **2 วันซื้อขายแรกตั้งแต่วันแจ้งงบครบ** (วันตอบรับจริงคือ 1 ใน 2 วันนั้น ดู `_earnings_day_reaction`) และใช้เช็คแบบ superset เท่านั้น **ใช้ได้เมื่อข้อมูลข่าวสด** (`set_news.news_data_age_hours()` ≤ 36 ชม.) ไม่สด = คืน None ให้ถอยโหมดถัดไป (fail open — เว็บ SET ล่มต้องยังสแกนได้)
+2. โหมดทั้งตลาด (`run_full_scan` — สำรอง): คัดหยาบจาก parquet cache ของโปรเจกต์ Trading_Dashboard (~883 ตัว ไม่ยิง Yahoo) แล้วยืนยันเฉพาะตัวที่เข้าเกณฑ์ด้วยข้อมูลสด — ข้อมูล dashboard เก่าเกิน 5 วันจะ fallback ต่อ path ของ cache ตั้งผ่าน env var `DASHBOARD_TH_CACHE` ใน `.env` (เว้นว่าง = ข้ามโหมดนี้)
+3. โหมด universe (`run_scan` — สำรองสุดท้าย): รายชื่อใน `scan_universe.txt` (~94 ตัว) ยิง Yahoo ทีละตัว
+
+ทุกโหมดเขียน `scan_log.csv` schema เดียวกัน — เทียบสถิติก่อน/หลังเปลี่ยนวิธีได้จากคอลัมน์ `scan_date` (จุดตัด 2026-07-12) ฝั่ง `news_monitor_job` มี self-healing: คำนวณ `days_back` จากอายุข้อมูลข่าว เพื่อไม่ให้ `filings_log.csv` มีรูช่วงเว็บล่มข้ามวันขณะบอทเปิดอยู่ (สแกนโหมดหลักพึ่งความครบของไฟล์นี้)
 
 ## ไฟล์ข้อมูล/สถานะ (gitignore ทั้งหมด — อย่า commit)
 

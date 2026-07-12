@@ -9,9 +9,12 @@ import os
 import csv
 import time
 import datetime
+from zoneinfo import ZoneInfo
 
 import stock_core
 from stock_core import format_signed_pct, volume_flag, signal_score
+
+_BKK = ZoneInfo("Asia/Bangkok")
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UNIVERSE_PATH = os.path.join(_BASE_DIR, "scan_universe.txt")
@@ -119,6 +122,124 @@ def coarse_candidates(window_days=None):
                 out.append(sym)
                 break
     return out
+
+
+# ── โหมดหลัก: สแกนจากรายชื่อ "บริษัทที่แจ้งงบแล้ว" (ข่าวเว็บ SET) ──
+# แม่นกว่าการไล่หาราคาพุ่งทั้งตลาดแล้วค่อยถามว่าเกี่ยวกับงบไหม เพราะรู้ตัว
+# ผู้แจ้งงบเป๊ะๆ จาก filings_log.csv + คลังวันงบ — ครอบคลุมทุกบริษัทที่แจ้งงบ
+# (ไม่จำกัดแค่ตัวที่อยู่ใน cache ของ Trading_Dashboard) และไม่พึ่งความสด
+# ของ parquet — parquet เหลือบทบาทเป็นตัวกรองหยาบเสริม (มีก็ใช้ ไม่มีก็ข้าม)
+
+NEWS_FRESH_MAX_HOURS = 36  # ข้อมูลข่าวเก่ากว่านี้ = ระบบข่าวอาจล่ม → ถอยโหมดเดิม
+
+
+def _parquet_prefilter(candidates):
+    """คัดทิ้ง candidate ที่ parquet ยืนยันได้ว่าตั้งแต่วันแจ้งงบมา
+    "ไม่มีวันไหนตอบรับถึงเกณฑ์เลย" — เช็คแบบ superset (มีสักวันที่ผ่านเกณฑ์
+    ก็เก็บไว้ให้ Yahoo ตัดสินขั้นสุดท้าย) จึงไม่มีทางตัดตัวจริงทิ้ง
+
+    candidates: {symbol: วันแจ้งงบ (date)} → คืน (kept_symbols, dropped_count)
+    ไม่มี parquet / ข้อมูลไม่ครอบคลุมช่วงหลังแจ้งงบ = ตัดสินไม่ได้ → เก็บไว้
+    """
+    kept, dropped = [], 0
+    if not DASHBOARD_TH_CACHE:
+        return sorted(candidates), dropped
+    import pandas as pd
+    for sym, filed in sorted(candidates.items()):
+        fp = os.path.join(DASHBOARD_TH_CACHE, f"{sym}.parquet")
+        if not os.path.exists(fp):
+            kept.append(sym)
+            continue
+        try:
+            df = pd.read_parquet(fp).tail(120)
+        except Exception:
+            kept.append(sym)
+            continue
+        dates = [ts.date() for ts in df.index]
+        # วันตอบรับจริงคือ 1 ใน 2 วันซื้อขายแรกตั้งแต่วันแจ้งงบ (ดู
+        # stock_core._earnings_day_reaction) — ตัดได้เฉพาะเมื่อ parquet
+        # ครอบทั้ง 2 วันนั้นแล้ว ข้อมูลยังมาไม่ครบ = ห้ามตัดสิน
+        post = [i for i, d in enumerate(dates) if d >= filed]
+        if len(post) < 2:
+            kept.append(sym)
+            continue
+        start = post[0]
+        if start < 21:  # ประวัติก่อนวันงบไม่พอคำนวณวอลุ่มเฉลี่ย 20 วัน
+            kept.append(sym)
+            continue
+        closes, vols = df["close"], df["volume"]
+        ok = False
+        for i in range(start, len(df)):
+            prev_close = closes.iloc[i - 1]
+            if not prev_close:
+                continue
+            chg = (closes.iloc[i] - prev_close) / prev_close * 100
+            avg_vol = float(vols.iloc[i - 20:i].mean())
+            vr = (float(vols.iloc[i]) / avg_vol) if avg_vol else 0
+            if chg >= MIN_CHANGE_PCT and vr >= MIN_VOL_RATIO:
+                ok = True
+                break
+        if ok:
+            kept.append(sym)
+        else:
+            dropped += 1
+    return kept, dropped
+
+
+def run_filings_scan():
+    """สแกนจากรายชื่อบริษัทที่แจ้งงบใน MAX_DAYS_SINCE วันล่าสุด
+
+    แหล่ง candidate: filings_log.csv (ข่าวเว็บ SET) + คลังวันงบในเครื่อง
+    (รวมที่ผู้ใช้บันทึกเองผ่าน "งบ XXX วันที่") แล้วยืนยันทุกตัวด้วยข้อมูลสด
+    จาก Yahoo ตามเกณฑ์เดิมเป๊ะ — ผลบันทึกลง scan_log.csv schema เดิม
+
+    คืน (hits, candidate_count, no_data_syms, dropped_count)
+    หรือ None ถ้าข้อมูลข่าวไม่สด (poll ล้มนาน/ไม่เคยดึง) — ผู้เรียกถอยไป
+    โหมด parquet/รายชื่อหลักแทน (fail open: เว็บ SET ล่มต้องยังสแกนได้)
+    """
+    import set_news  # import ในฟังก์ชัน: set_news เอง import scanner (กันวนซ้ำ)
+    age = set_news.news_data_age_hours()
+    if age is None or age > NEWS_FRESH_MAX_HOURS:
+        return None
+
+    now = datetime.datetime.now(_BKK)
+    since = now - datetime.timedelta(days=MAX_DAYS_SINCE)
+    candidates = {}  # {symbol: วันแจ้งงบ}
+    for sym, d in stock_core.symbols_with_recent_earnings(MAX_DAYS_SINCE).items():
+        candidates[sym] = d
+    for sym, info in set_news.load_filings_since(since).items():
+        candidates[sym] = info["datetime"].date()  # ข่าวจริงชนะวันจากคลัง
+
+    kept, dropped = _parquet_prefilter(candidates)
+    hits = []
+    no_data = []  # แจ้งงบแล้วแต่ Yahoo ไม่มีข้อมูลราคา (หุ้นเล็ก/กอง REIT บางตัว)
+    for sym in kept:
+        try:
+            d = stock_core.get_stock_data(sym)
+        except Exception:
+            d = None
+        time.sleep(0.2)  # เว้นจังหวะกัน rate limit
+        if d is None:
+            no_data.append(sym)
+            continue
+        if not d["ticker"].endswith(".BK"):
+            continue  # คลังวันงบมีหุ้น US ที่เคยเปิดดูปนอยู่ — สแกนนี้เอาเฉพาะ SET
+        days = d["days_since_earnings"]
+        r = d["earn_reaction"]
+        if days is None or days > MAX_DAYS_SINCE:
+            continue
+        if r is None or r["change_pct"] is None:
+            continue
+        if r["change_pct"] < MIN_CHANGE_PCT or (r["vol_ratio"] or 0) < MIN_VOL_RATIO:
+            continue
+        hits.append(d)
+
+    hits.sort(
+        key=lambda d: (signal_score(d)[0] or 0, d["since_earnings_pct"] or 0),
+        reverse=True,
+    )
+    _append_log(hits)
+    return hits, len(candidates), no_data, dropped
 
 
 def run_full_scan():
@@ -240,7 +361,7 @@ def _append_log(hits):
 
 
 def format_report(hits, scanned_count, html=True, limit=15, source_note=None,
-                  unknowns=None):
+                  unknowns=None, unknowns_title=None, unknowns_hint=None):
     b = (lambda t: f"<b>{t}</b>") if html else (lambda t: t)
     today = datetime.date.today().strftime("%d/%m/%Y")
     lines = [
@@ -289,14 +410,18 @@ def format_report(hits, scanned_count, html=True, limit=15, source_note=None,
         shown = ", ".join(unknowns[:12])
         if len(unknowns) > 12:
             shown += f" ...(+{len(unknowns) - 12})"
-        lines += [
-            "",
-            "⚠️ ราคา/วอลุ่มพุ่งใน 7 วันนี้ แต่ไม่มีข้อมูลวันงบ:",
-            shown,
-            ("ถ้าตัวไหนเพิ่งออกงบจริง บันทึกวันเอง: งบ ชื่อหุ้น 13/11/2569"
-             if not html else
-             "ถ้าตัวไหนเพิ่งออกงบจริง บันทึกวันเอง: <code>งบ ชื่อหุ้น 13/11/2569</code>"),
-        ]
+        # ค่า default = ข้อความของโหมด parquet (เจอราคาพุ่งแต่ไม่รู้วันงบ)
+        # โหมดข่าวแจ้งงบส่งหัวข้อ/คำแนะนำของตัวเองมาแทน (unknowns_hint=""
+        # คือไม่ต้องมีบรรทัดแนะนำ)
+        title = unknowns_title or "⚠️ ราคา/วอลุ่มพุ่งใน 7 วันนี้ แต่ไม่มีข้อมูลวันงบ:"
+        hint = unknowns_hint
+        if hint is None:
+            hint = ("ถ้าตัวไหนเพิ่งออกงบจริง บันทึกวันเอง: งบ ชื่อหุ้น 13/11/2569"
+                    if not html else
+                    "ถ้าตัวไหนเพิ่งออกงบจริง บันทึกวันเอง: <code>งบ ชื่อหุ้น 13/11/2569</code>")
+        lines += ["", title, shown]
+        if hint:
+            lines.append(hint)
 
     if hits:
         lines.append("")
@@ -305,14 +430,35 @@ def format_report(hits, scanned_count, html=True, limit=15, source_note=None,
     return "\n".join(lines)
 
 
+# หัวข้อ ⚠️ ของโหมดข่าวแจ้งงบ (telegram_bot ใช้ด้วย — ให้ข้อความตรงกัน)
+FILINGS_UNKNOWNS_TITLE = "⚠️ แจ้งงบแล้วแต่ดึงข้อมูลราคาจาก Yahoo ไม่ได้:"
+
+
+def filings_source_note(dropped):
+    # จำนวน candidate แสดงในบรรทัด "(ตรวจ N ตัว...)" ของ format_report อยู่แล้ว
+    note = "โหมดข่าวแจ้งงบ • คัดเฉพาะบริษัทที่แจ้งงบจริง (ข่าวเว็บ SET + คลังวันงบ)"
+    if dropped:
+        note += f" — กรองหยาบด้วยข้อมูล Trading_Dashboard ออก {dropped} ตัว"
+    return note
+
+
 if __name__ == "__main__":
     print("\nกำลังสแกน... (ประมาณ 1-3 นาที)\n")
-    full = run_full_scan()
-    if full is not None:
-        hits, n, last_date, unknowns = full
-        note = f"โหมดทั้งตลาด • ข้อมูล Trading_Dashboard ถึง {last_date:%d/%m/%Y}"
+    res = run_filings_scan()
+    if res is not None:
+        hits, n, no_data, dropped = res
+        print(format_report(hits, n, html=False,
+                            source_note=filings_source_note(dropped),
+                            unknowns=no_data,
+                            unknowns_title=FILINGS_UNKNOWNS_TITLE,
+                            unknowns_hint=""))
     else:
-        hits, n = run_scan()
-        note, unknowns = "โหมดรายชื่อหลัก (ข้อมูล Trading_Dashboard ไม่สด)", None
-    print(format_report(hits, n, html=False, source_note=note, unknowns=unknowns))
+        full = run_full_scan()
+        if full is not None:
+            hits, n, last_date, unknowns = full
+            note = f"โหมดทั้งตลาด • ข้อมูล Trading_Dashboard ถึง {last_date:%d/%m/%Y}"
+        else:
+            hits, n = run_scan()
+            note, unknowns = "โหมดรายชื่อหลัก (ข้อมูล Trading_Dashboard ไม่สด)", None
+        print(format_report(hits, n, html=False, source_note=note, unknowns=unknowns))
     print(f"\nบันทึกผลลง {os.path.basename(LOG_PATH)} แล้ว\n")

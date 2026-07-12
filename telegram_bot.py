@@ -497,8 +497,14 @@ async def news_monitor_job(context: ContextTypes.DEFAULT_TYPE):
     chat_ids = _load_chat_ids()
     if not chat_ids:
         return
+    # อุดช่องที่ขาด: ถ้าดึงไม่สำเร็จมานาน (เว็บล่ม/เน็ตหลุดข้ามวัน) ให้ดึง
+    # ย้อนคลุมช่วงที่หายไปด้วย ไม่ใช่แค่วันเดียว — สแกนโหมดข่าวแจ้งงบ
+    # พึ่งความครบของ filings_log.csv จึงห้ามมีรูช่วงที่บอทเปิดอยู่
+    age_h = set_news.news_data_age_hours() or 0
+    days_back = min(7, max(1, int(age_h // 24) + 1))
     try:
-        hits = await asyncio.to_thread(set_news.check_new_earnings_news)
+        hits = await asyncio.to_thread(
+            set_news.check_new_earnings_news, 14, days_back)
     except Exception:
         log.exception("SET news poll failed")
         _news_fail_count += 1
@@ -1142,19 +1148,29 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def run_best_scan():
-    """สแกนทั้งตลาดจากข้อมูล Trading_Dashboard ถ้าข้อมูลสดพอ
-    ไม่งั้นถอยไปสแกนรายชื่อหลัก 94 ตัวผ่าน Yahoo ตามเดิม
+    """เลือกโหมดสแกนที่ดีที่สุดที่ใช้ได้ตอนนี้ (ลำดับ: ข่าวแจ้งงบ →
+    ทั้งตลาดจาก Trading_Dashboard → รายชื่อหลัก 94 ตัว)
 
-    คืน (hits, scanned_count, source_note, unknowns)"""
+    โหมดหลักคือข่าวแจ้งงบ: candidate มาจากรายชื่อบริษัทที่แจ้งงบจริง
+    (แม่น + ไม่พึ่งความสดของ parquet) — ถอยโหมดเดิมเฉพาะตอนข้อมูลข่าว
+    ไม่สด เช่นดึงข่าวเว็บ SET ล้มต่อเนื่อง (fail open: ข่าวล่มยังสแกนได้)
+
+    คืน (hits, scanned_count, source_note, unknowns, unknowns_title)"""
+    filings = scanner.run_filings_scan()
+    if filings is not None:
+        hits, n, no_data, dropped = filings
+        return (hits, n, scanner.filings_source_note(dropped),
+                no_data, scanner.FILINGS_UNKNOWNS_TITLE)
     full = scanner.run_full_scan()
     if full is not None:
         hits, n, last_date, unknowns = full
-        note = f"โหมดทั้งตลาด • ข้อมูล Trading_Dashboard ถึง {last_date:%d/%m/%Y}"
-        return hits, n, note, unknowns
+        note = ("โหมดทั้งตลาด (สำรอง — ข้อมูลข่าวแจ้งงบไม่สด) • "
+                f"ข้อมูล Trading_Dashboard ถึง {last_date:%d/%m/%Y}")
+        return hits, n, note, unknowns, None
     hits, n = scanner.run_scan()
-    note = ("โหมดรายชื่อหลัก (ข้อมูล Trading_Dashboard ไม่สด — "
-            "รัน bt_fetch.py ที่โปรเจคนั้นเพื่อปลดล็อกสแกนทั้งตลาด 883 ตัว)")
-    return hits, n, note, None
+    note = ("โหมดรายชื่อหลัก (ข้อมูลข่าวแจ้งงบและ Trading_Dashboard ไม่สด — "
+            "เช็คข่าวด้วย python set_news.py หรือรัน bt_fetch.py ที่โปรเจคนั้น)")
+    return hits, n, note, None, None
 
 
 async def daily_scan_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1165,11 +1181,13 @@ async def daily_scan_job(context: ContextTypes.DEFAULT_TYPE):
     if not chat_ids:
         return
     try:
-        hits, n, note, unknowns = await asyncio.to_thread(run_best_scan)
+        hits, n, note, unknowns, unk_title = await asyncio.to_thread(run_best_scan)
     except Exception:
         log.exception("daily scan failed")
         return
-    report = scanner.format_report(hits, n, source_note=note, unknowns=unknowns)
+    report = scanner.format_report(
+        hits, n, source_note=note, unknowns=unknowns,
+        unknowns_title=unk_title, unknowns_hint="" if unk_title else None)
     buttons = _watch_buttons(hits)
     for cid in chat_ids:
         try:
@@ -1602,10 +1620,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "🔍 กำลังสแกน... ใช้เวลาประมาณ 1-3 นาที รอสักครู่ครับ"
         )
-        hits, n, note, unknowns = await asyncio.to_thread(run_best_scan)
+        hits, n, note, unknowns, unk_title = await asyncio.to_thread(run_best_scan)
         await _reply_long(
             update.message,
-            scanner.format_report(hits, n, source_note=note, unknowns=unknowns),
+            scanner.format_report(
+                hits, n, source_note=note, unknowns=unknowns,
+                unknowns_title=unk_title, unknowns_hint="" if unk_title else None),
             reply_markup=_watch_buttons(hits),
             parse_mode="HTML",
         )

@@ -15,6 +15,7 @@ import os
 import re
 import csv
 import json
+import time
 import datetime
 import threading
 from zoneinfo import ZoneInfo
@@ -402,6 +403,19 @@ def _save_seen(seen):
             json.dump(pruned, f, ensure_ascii=False, indent=1)
     except Exception:
         pass
+
+
+def news_data_age_hours():
+    """อายุ (ชั่วโมง) ของข้อมูลข่าวรอบล่าสุดที่ดึงสำเร็จ — ดูจาก mtime ของ
+    news_seen.json ซึ่งถูกเขียนทุกครั้งที่ poll สำเร็จ (แม้ไม่มีข่าวใหม่)
+
+    ใช้สองที่: สแกนโหมดข่าวแจ้งงบเช็คว่าข้อมูลสดพอไหม และ news poll
+    คำนวณว่าต้องดึงย้อนกี่วันเพื่ออุดช่องที่ขาด — คืน None ถ้ายังไม่เคยดึงเลย"""
+    try:
+        mtime = os.path.getmtime(_SEEN_PATH)
+    except OSError:
+        return None
+    return (time.time() - mtime) / 3600
 
 
 # ── หน้าที่หลักสองแบบ ───────────────────────────────────────────

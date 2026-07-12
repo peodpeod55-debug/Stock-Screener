@@ -158,6 +158,29 @@ def _parse_iso_dates(strings):
     return sorted(out)
 
 
+def symbols_with_recent_earnings(days: int):
+    """รายชื่อหุ้นที่คลังวันงบรู้ว่ามีวันงบภายใน days วันล่าสุด → {symbol: date}
+
+    อ่านจากคลังในเครื่องล้วนๆ ไม่ยิงเครือข่าย — ครอบคลุมทั้งวันจากข่าว SET
+    (manual), ที่ผู้ใช้บันทึกเองผ่านคำสั่ง "งบ XXX วันที่", และวันจาก Yahoo
+    ที่เคยดึงไว้ (auto) — ใช้เป็นแหล่ง candidate ของสแกนโหมดข่าวแจ้งงบ"""
+    today = datetime.date.today()
+    out = {}
+    for sym, entry in _EARN_STORE.items():
+        dates = set(entry.get("manual_dates", [])) | set(entry.get("auto_dates", []))
+        best = None
+        for iso in dates:
+            try:
+                d = datetime.date.fromisoformat(iso)
+            except ValueError:
+                continue
+            if 0 <= (today - d).days <= days and (best is None or d > best):
+                best = d
+        if best is not None:
+            out[sym] = best
+    return out
+
+
 def _get_earnings_dates(stock, used_ticker):
     """รวมวันงบจาก Yahoo (refresh วันละครั้ง) + ที่บันทึกเอง
 
