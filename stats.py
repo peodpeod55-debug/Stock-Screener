@@ -137,6 +137,17 @@ def _trades_section(b, chat_id=None):
     return lines
 
 
+def _shadow_section(b):
+    """สรุปไม้เงาจาก cache (shadow_log.csv) — ไม่ยิงเครือข่าย ให้ "สถิติ" ตอบเร็ว
+    (ไม้ที่ยังเปิด/เพิ่งครบกำหนดต้องพิมพ์ "เงา" ให้ระบบอัปเดตก่อน)"""
+    import shadow
+    lines = shadow.summary_lines(shadow.load_closed(), indent="  ")
+    if not lines:
+        return []
+    return ["", b("👻 ไม้เงา (ระบบเทรดกระดาษเองจากผลสแกน)"), *lines,
+            "  อัปเดต + ดูไม้ที่ยังเปิด: พิมพ์ \"เงา\""]
+
+
 def build_stats_report(html: bool = True, chat_id=None) -> str:
     """chat_id: จำกัดส่วนไม้จริงเฉพาะ chat นั้น (None = ทุก chat — โหมด CLI)"""
     b = (lambda t: f"<b>{t}</b>") if html else (lambda t: t)
@@ -185,6 +196,7 @@ def build_stats_report(html: bool = True, chat_id=None) -> str:
                 lines.append(f"(อีก {pending} รายการยังวัดไม่ได้ — ใหม่เกินไปหรือดึงราคาไม่สำเร็จ)")
             lines.append("หมายเหตุ: ตัวเลขไม่รวมค่าธรรมเนียม และวัดแบบถือครบกำหนดเท่านั้น")
 
+    lines += _shadow_section(b)
     lines += _trades_section(b, chat_id)
     return "\n".join(lines)
 

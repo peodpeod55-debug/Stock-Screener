@@ -19,6 +19,7 @@ python stock_lookup.py AOT    # ดูหุ้นรายตัวผ่าน
 python scanner.py             # สแกนหาหุ้นตอบรับงบดีด้วยมือ
 python set_news.py            # ดึงข่าวแจ้งงบจากเว็บ SET (ทดสอบ Playwright)
 python stats.py               # สถิติย้อนหลังจาก scan_log.csv (คะแนนทำนายได้จริงไหม)
+python shadow.py              # ไม้เงา — จำลองเทรดทุกตัวที่ติดสแกนตามกติกา ⛔/20 วัน
 python backtest.py            # backtest ระบบคะแนนกับข้อมูล ~2 ปี (ใช้เวลา 5-10 นาที)
 ```
 
@@ -33,7 +34,8 @@ telegram_bot.py   ← entry point: handler + scheduled jobs ทั้งหม�
   ├── stock_core.py   ← โมดูลกลาง: ดึงข้อมูล Yahoo, คำนวณสัญญาณ, คะแนน, watchlist
   ├── scanner.py      ← สแกนหุ้นตอบรับงบ (เกณฑ์: ตอบรับ ≥2%, วอลุ่ม ≥1.5 เท่า)
   ├── set_news.py     ← ดึงข่าวแจ้งงบจากเว็บ SET ผ่าน Playwright
-  └── stats.py        ← สถิติจาก scan_log.csv
+  ├── stats.py        ← สถิติจาก scan_log.csv (+สรุปไม้เงาจาก cache)
+  └── shadow.py       ← ไม้เงา: replay ทุกแถวใน scan_log เป็นเทรดจำลอง
 stock_lookup.py       ← CLI ดูหุ้นรายตัว (ใช้ stock_core เหมือนบอท)
 backtest.py           ← จำลองระบบคะแนนกับวันงบเก่าจาก Yahoo
 ```
@@ -57,14 +59,17 @@ backtest.py           ← จำลองระบบคะแนนกับว
 | 08:55 | สรุปงบเช้า — รวบหุ้นแจ้งงบตั้งแต่เย็นวาน+เช้านี้เป็นข้อความเดียว |
 | 10:30 | ยืนยันรอบเช้า — หุ้นงบโตแรงเมื่อคืน แบ่ง ✅ ตลาดยืนยัน / 😐 / ❌ ตัดทิ้ง ตาม %วันนี้+วอลุ่มสะสม (ไม่มีตัวโตแรง = ไม่ส่ง) |
 | 10:00-17:00 ทุก 15 นาที | เช็ค watchlist — เด้งเฉพาะตอนสถานะเปลี่ยน (🔥 ทะลุไฮ 3 ด. / 📈 ไฮใหม่ / ⛔ หลุด Low ก่อนงบ) |
-| 17:30 | สแกนอัตโนมัติหลังปิดตลาด |
+| 17:30 | สแกนอัตโนมัติหลังปิดตลาด — จบแล้วอัปเดต cache ไม้เงา (`shadow.update_shadow`) ต่อท้าย |
+| 17:45 | รายงานไม้เปิด (เฉพาะ chat ที่มีไม้จริงเปิด): R ปัจจุบัน / % ถึงเส้น ⛔ / วันเงียบ + ⚠️ ตามกติกา workflow — มี startup fallback (หน่วง 390 วิ, เฉพาะหลัง 17:45) |
+| อาทิตย์ 19:00 (job รายวัน) | ปฏิทินงบ 14 วันข้างหน้า จาก `stock_core.upcoming_earnings()` — กันซ้ำรายสัปดาห์ด้วย anchor "วันอาทิตย์ล่าสุด" (key `calendar_last_sent`) จึงลงเป็น job รายวัน + startup fallback (หน่วง 420 วิ): คอมปิดวันอาทิตย์ก็ส่งชดเชยครั้งแรกที่เปิดในสัปดาห์นั้น |
 | ตอนเปิดบอท | startup catch-up: ดูจากอายุข้อมูลข่าว (mtime ของ `news_seen.json` — ห้ามใช้ `last_alive.json` เพราะโดน alive_job เขียนทับก่อน catch-up อ่าน) ถ้าเก่าเกิน 20 ชม. ดึงข่าวย้อนหลัง (สูงสุด 7 วัน) มาเก็บตกวันงบ |
 | ตอนเปิดบอท (หน่วง 300 วิ) | startup digest: ส่งสรุปงบเช้าถ้าวันนี้ยังไม่ได้ส่ง (รองรับผู้ใช้เปิดคอมสาย ~09:30 เกินเวลา job 08:55) — ยืนยันรอบเช้าก็มี fallback แบบเดียวกัน (หน่วง 330 วิ, เฉพาะช่วง 10:30-12:00) |
 
 - ถ้าดึงข่าว SET ล้มเหลวติดต่อกัน ≥3 รอบ (~30 นาที) บอทเด้ง ⚠️ เตือนผู้ใช้เองครั้งเดียวต่อการล่มหนึ่งช่วง และแจ้ง ✅ เมื่อกลับมาปกติ (ตัวนับใน memory ของ `news_monitor_job`)
-- คำสั่งผู้ใช้เป็น**ข้อความภาษาไทยธรรมดา** (สแกน / ติดตาม XXX / ลิสต์ / สถิติ / งบ XXX วันที่ / ข่าวงบ / สรุปงบ N / ยืนยัน / พอร์ต N / ไม้ XXX / ซื้อ-ขาย XXX ราคา / เทรด) ผ่าน `handle_text()` — ไม่ใช่ slash command และทุกคำสั่งมี alias อังกฤษ (scan/watch/unwatch/list/stats/earn/news/digest/confirm/port/size/buy/sell/trades) เช็คแบบ case-insensitive — เพิ่มคำสั่งใหม่ต้องมี alias อังกฤษด้วย
+- คำสั่งผู้ใช้เป็น**ข้อความภาษาไทยธรรมดา** (สแกน / ติดตาม XXX / ลิสต์ / สถิติ / เงา / งบ XXX วันที่ / ปฏิทิน / ข่าวงบ / สรุปงบ N / ยืนยัน / พอร์ต N / ไม้ XXX / ซื้อ-ขาย XXX ราคา / เทรด) ผ่าน `handle_text()` — ไม่ใช่ slash command และทุกคำสั่งมี alias อังกฤษ (scan/watch/unwatch/list/stats/shadow/earn/calendar/news/digest/confirm/port/size/buy/sell/trades) เช็คแบบ case-insensitive — เพิ่มคำสั่งใหม่ต้องมี alias อังกฤษด้วย
 - position sizing (`ไม้ XXX`): เสี่ยง `RISK_PCT_PER_TRADE` (1%) ของพอร์ตต่อไม้ ÷ ระยะราคาเข้า→เส้น ⛔ (pre_earn_low) ปัดลง lot ละ 100 — ขนาดพอร์ตเก็บต่อ chat ใน `port_settings.json`
-- trade journal (`ซื้อ/ขาย/เทรด`): เก็บลง `trades_log.csv` แบบ append-only ผ่าน `stock_core.log_trade` — แถวซื้อเก็บบริบท ณ ตอนเข้า (วันงบ/เส้น ⛔/คะแนน) เพราะย้อนหลังไม่ได้ ส่วนกำไร/R คำนวณตอนอ่านจาก `pair_trades` (หนึ่งไม้เปิดต่อหุ้นต่อ chat) — `stats.build_stats_report(html, chat_id)` ต่อท้ายส่วน "ผลไม้จริง" เทียบตามช่วงคะแนน
+- trade journal (`ซื้อ/ขาย/เทรด`): เก็บลง `trades_log.csv` แบบ append-only ผ่าน `stock_core.log_trade` — แถวซื้อเก็บบริบท ณ ตอนเข้า (วันงบ/เส้น ⛔/คะแนน) เพราะย้อนหลังไม่ได้ ส่วนกำไร/R คำนวณตอนอ่านจาก `pair_trades` (หนึ่งไม้เปิดต่อหุ้นต่อ chat) — `stats.build_stats_report(html, chat_id)` ต่อท้ายส่วน "ไม้เงา" (จาก cache) และ "ผลไม้จริง" เทียบตามช่วงคะแนน
+- ไม้เงา (`เงา` / shadow.py): ทุกแถวใน `scan_log.csv` = ไม้จำลอง (ครั้งแรกต่อ ticker+วันงบ) เข้า open วันถัดจากวันสแกน / ตัดปิดหลุด `pre_earn_low` / ครบ 20 วันทำการ — replay จากราคาย้อนหลังตามปรัชญา "คำนวณย้อนหลังได้เสมอ" ไม่มี job เฝ้า ไม้ปิดแล้ว cache ลง `shadow_log.csv` เรียกซ้ำยิง Yahoo เฉพาะไม้ที่ยังเปิด — BANDS ใช้ของ stats (lazy import ใน `_bands()` กัน import วนกับ stats ที่เรียก shadow)
 - ข้อความ Telegram เป็น HTML, จำกัด 3900 ตัวอักษร/ข้อความ — ส่งข้อความยาวต้องใช้ `_reply_long` / `_send_long`
 - แนวคิดสามคำสั่งหลัก: **สแกนหา → ติดตามเฝ้า → ลิสต์ดู** — เฉพาะ "ติดตาม" เท่านั้นที่ทำให้บอทเฝ้าและเด้งเตือน
 - สุขอนามัยลิสต์: `build_watchlist_summary` คืน `(text, stale)` — ตัวที่โดน ⛔ / งบเกิน 60 วัน / ไม่รู้วันงบ ติดป้าย 🗑 พร้อมปุ่มลบ (callback `unwatch:SYM`) ยกเว้นตัวที่งบรอบใหม่ ≤14 วัน (ติดตามรองบ)
@@ -86,7 +91,7 @@ backtest.py           ← จำลองระบบคะแนนกับว
 
 ## ไฟล์ข้อมูล/สถานะ (gitignore ทั้งหมด — อย่า commit)
 
-`.env` (BOT_TOKEN), `watchlist.json`, `chat_ids.json`, `news_seen.json`, `last_alive.json`, `watch_state.json`, `scan_log.csv`, `lookup_log.csv`, `backtest_results.csv`, `bot_log.txt`, `.yf_cache/`, `filings_log.csv` (ใครแจ้งงบเมื่อไหร่ — ดิบกว่า earnings_results.csv รวมตัวที่อ่านตัวเลขไม่ได้ด้วย), `digest_state.json` (กันส่งสรุปงบเช้า/ยืนยันรอบเช้า/เตือนวันงบซ้ำในวันเดียว — key `last_sent` / `confirm_last_sent` / `remind_last_sent`), `port_settings.json` (ขนาดพอร์ตต่อ chat สำหรับคำนวณขนาดไม้), `trades_log.csv` (บันทึกไม้จริง — append-only เหมือน scan_log)
+`.env` (BOT_TOKEN), `watchlist.json`, `chat_ids.json`, `news_seen.json`, `last_alive.json`, `watch_state.json`, `scan_log.csv`, `lookup_log.csv`, `backtest_results.csv`, `bot_log.txt`, `.yf_cache/`, `filings_log.csv` (ใครแจ้งงบเมื่อไหร่ — ดิบกว่า earnings_results.csv รวมตัวที่อ่านตัวเลขไม่ได้ด้วย), `digest_state.json` (กันส่งรายงานอัตโนมัติซ้ำ — key รายวัน `last_sent` / `confirm_last_sent` / `remind_last_sent` / `openpos_last_sent` + รายสัปดาห์ `calendar_last_sent` เก็บ anchor วันอาทิตย์ล่าสุด), `port_settings.json` (ขนาดพอร์ตต่อ chat สำหรับคำนวณขนาดไม้), `trades_log.csv` (บันทึกไม้จริง — append-only เหมือน scan_log), `shadow_log.csv` (ไม้เงาที่ปิดแล้ว — cache สร้างใหม่ได้เสมอจาก scan_log)
 
 ไฟล์ log แบบ append (scan_log, lookup_log) คือข้อมูลสะสมที่ใช้วิเคราะห์ย้อนหลัง — เปลี่ยน schema คอลัมน์ต้องระวังไฟล์เก่าที่มีอยู่
 

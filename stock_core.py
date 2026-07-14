@@ -181,6 +181,27 @@ def symbols_with_recent_earnings(days: int):
     return out
 
 
+def upcoming_earnings(days: int = 14):
+    """หุ้นที่คลังวันงบรู้ว่ามีวันงบภายใน days วันข้างหน้า → [(symbol, date)]
+
+    อ่านจากคลังในเครื่องล้วนๆ ไม่ยิงเครือข่าย — วัน manual ชนะ auto
+    (เหตุผลเดียวกับ next_earnings ใน get_stock_data: บริษัทเลื่อนวันได้)
+    เรียงตามวันงบ แล้วตามชื่อ — ใช้ทำ "ปฏิทินงบ" ในบอท"""
+    today = datetime.date.today()
+
+    def next_within(entry, key):
+        ds = _parse_iso_dates(entry.get(key, []))
+        return min((d for d in ds if 0 <= (d - today).days <= days), default=None)
+
+    out = []
+    for sym, entry in _EARN_STORE.items():
+        best = next_within(entry, "manual_dates") or next_within(entry, "auto_dates")
+        if best is not None:
+            out.append((sym, best))
+    out.sort(key=lambda x: (x[1], x[0]))
+    return out
+
+
 def _get_earnings_dates(stock, used_ticker):
     """รวมวันงบจาก Yahoo (refresh วันละครั้ง) + ที่บันทึกเอง
 

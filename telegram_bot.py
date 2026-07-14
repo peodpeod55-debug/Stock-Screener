@@ -21,6 +21,7 @@ from telegram.ext import (
 )
 
 import stats
+import shadow
 import scanner
 import set_news
 import stock_core
@@ -260,7 +261,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  – % ห่างจากราคาปัจจุบัน\n\n"
         "<b>วันประกาศงบ</b>\n"
         "• <code>งบ AOT</code> — ดูวันงบล่าสุด/ถัดไป\n"
-        "• <code>งบ AOT 13/11/2569</code> — บันทึกวันงบเอง\n\n"
+        "• <code>งบ AOT 13/11/2569</code> — บันทึกวันงบเอง\n"
+        "• <code>ปฏิทิน</code> — ใครงบออกใน 14 วันข้างหน้า "
+        "(บอทส่งเองสัปดาห์ละครั้ง เย็นอาทิตย์)\n\n"
         "<b>ติดตามหุ้นหลังงบ</b>\n"
         "• <code>ติดตาม AOT</code> — เพิ่มเข้าลิสต์ (หรือกดปุ่ม ➕ ใต้ผลสแกน)\n"
         "• <code>ลิสต์</code> — จัดอันดับตามคะแนนสัญญาณหลังงบ\n"
@@ -277,7 +280,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  ณ ตอนเข้า (ใส่จำนวนหุ้นได้: <code>ซื้อ AOT 32.50 300</code>)\n"
         "• <code>ขาย AOT 35.00</code> — ปิดไม้ สรุป % กำไรและ R ทันที\n"
         "• <code>เทรด</code> — ไม้ที่เปิดอยู่ + ผลไม้ที่ปิดแล้ว\n"
+        "• มีไม้เปิด → บอทรายงาน R / ระยะถึง ⛔ / วันเงียบ ให้เองทุก 17:45\n"
         "• <code>สถิติ</code> เทียบผลไม้จริงกับผลระบบให้อัตโนมัติ\n\n"
+        "<b>ไม้เงา (ระบบเทรดกระดาษเอง)</b>\n"
+        "• <code>เงา</code> — ทุกตัวที่ติดสแกนถูกจำลองเป็นไม้: เข้าเปิด\n"
+        "  วันถัดไป ตัดหลุด ⛔ ถือสูงสุด 20 วัน — พิสูจน์ว่าคะแนน\n"
+        "  ยังทำนายได้จริงในตลาดตอนนี้ โดยไม่ใช้เงินจริง\n\n"
         "<b>ข่าวแจ้งงบจากเว็บ SET</b>\n"
         "• <code>ข่าวงบ</code> — ใครแจ้งผลประกอบการแล้วบ้าง (2 วันล่าสุด)\n"
         "• <code>สรุปงบ</code> — สรุปหุ้นแจ้งงบเมื่อวาน+เช้านี้ เรียงตามกำไรโต "
@@ -298,6 +306,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ทุกคำสั่งพิมพ์เป็นอังกฤษได้ (ตัวเล็ก-ใหญ่ไม่สำคัญ):\n"
         "<code>scan</code> / <code>news</code> / <code>digest</code> / "
         "<code>confirm</code> / <code>stats</code> / <code>earn AOT</code> / "
+        "<code>calendar</code> / <code>shadow</code> / "
         "<code>watch AOT</code> / <code>unwatch AOT</code> / <code>list</code> / "
         "<code>port 500000</code> / <code>size AOT</code> / "
         "<code>buy AOT 32.50</code> / <code>sell AOT 35</code> / <code>trades</code>",
@@ -1111,6 +1120,94 @@ async def startup_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     await _run_earnings_reminder(context, "startup earnings reminder")
 
 
+# ── ปฏิทินงบล่วงหน้า (อาทิตย์ 19:00 หรือเรียกเองด้วย "ปฏิทิน") ──
+# มองไปข้างหน้า 14 วัน — เติมช่องว่างของเตือน 08:45 ที่เห็นแค่วันนี้/พรุ่งนี้
+# ให้วางแผนก่อนฤดูงบได้ทั้งสัปดาห์
+
+CALENDAR_HOUR, CALENDAR_MINUTE = 19, 0   # เวลาส่งปฏิทิน (เย็นวันอาทิตย์)
+CALENDAR_DAYS_AHEAD = 14                 # มองล่วงหน้ากี่วัน
+
+
+def build_earnings_calendar(chat_id=None) -> str:
+    """ปฏิทินงบจากคลังวันงบในเครื่อง (ไม่ยิงเครือข่าย — ตอบได้ทันที)
+    คืน "" ถ้าไม่รู้วันงบของตัวไหนเลยในช่วงนั้น"""
+    upcoming = stock_core.upcoming_earnings(CALENDAR_DAYS_AHEAD)
+    if not upcoming:
+        return ""
+    watch = set(stock_core.get_watchlist(chat_id)) if chat_id is not None else set()
+    today = datetime.date.today()
+    by_day = {}
+    for sym, d in upcoming:
+        star = " ⭐" if sym in watch else ""
+        by_day.setdefault(d, []).append(html.escape(sym) + star)
+    lines = [f"📅 <b>ปฏิทินงบ {CALENDAR_DAYS_AHEAD} วันข้างหน้า</b> "
+             f"({len(upcoming)} ตัวที่รู้วันงบ)"]
+    for d, syms in sorted(by_day.items()):
+        rel = (d - today).days
+        rel_txt = "วันนี้" if rel == 0 else ("พรุ่งนี้" if rel == 1 else f"อีก {rel} วัน")
+        lines.append(f"• {_THAI_WEEKDAY[d.weekday()]} {d:%d/%m} ({rel_txt}): "
+                     + ", ".join(syms))
+    lines.append("")
+    lines.append("⭐ = อยู่ในลิสต์ติดตาม • คลังวันงบมีเฉพาะตัวที่บอทเคยเห็น "
+                 "(ข่าว SET / เคยกดดู / บันทึกเอง) อาจไม่ครบทุกบริษัท")
+    lines.append("บันทึกวันงบเพิ่ม: <code>งบ XXXX 14/08/2569</code>")
+    return "\n".join(lines)
+
+
+# กันส่งซ้ำรายสัปดาห์: anchor = วันอาทิตย์ล่าสุด — ส่งอาทิตย์ 19:00 ถ้าคอมเปิด
+# คอมปิดทั้งวันอาทิตย์ก็ไม่พลาด: job 19:00 วันถัดๆ ไป / startup fallback ส่งชดเชย
+# (เทียบ anchor เดียวกันจึงไม่ส่งซ้ำถ้าสัปดาห์นี้ส่งไปแล้ว)
+_calendar_in_flight = False
+
+
+def _last_sunday(day: datetime.date) -> datetime.date:
+    return day - datetime.timedelta(days=(day.weekday() + 1) % 7)
+
+
+async def _run_calendar(context: ContextTypes.DEFAULT_TYPE, label: str):
+    """ตัวส่งปฏิทินงบกลาง: สัปดาห์ละครั้ง (นับสัปดาห์แบบ อา-ส)
+    ไม่มีตัวไหนรู้วันงบ = ไม่ส่ง ไม่บันทึกสถานะ (trigger ถัดไปลองใหม่ได้)"""
+    global _calendar_in_flight
+    now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
+    anchor = _last_sunday(now.date()).isoformat()
+    if _calendar_in_flight:
+        return
+    if _load_digest_state().get("calendar_last_sent") == anchor:
+        return
+    chat_ids = _load_chat_ids()
+    if not chat_ids:
+        return
+    _calendar_in_flight = True
+    try:
+        sent_any = False
+        for cid in chat_ids:
+            text = build_earnings_calendar(cid)
+            if not text:
+                continue
+            try:
+                await _send_long(context.bot, cid, text, parse_mode="HTML")
+                sent_any = True
+            except Exception:
+                log.exception("send %s failed (chat %s)", label, cid)
+        if sent_any:
+            state = _load_digest_state()
+            state["calendar_last_sent"] = anchor
+            _save_digest_state(state)
+    finally:
+        _calendar_in_flight = False
+
+
+async def calendar_job(context: ContextTypes.DEFAULT_TYPE):
+    """job รายวัน 19:00 — anchor รายสัปดาห์ทำให้ส่งจริงแค่ครั้งแรกของสัปดาห์
+    ที่คอมเปิดตอน 19:00 (ปกติคือเย็นวันอาทิตย์)"""
+    await _run_calendar(context, "earnings calendar")
+
+
+async def startup_calendar_job(context: ContextTypes.DEFAULT_TYPE):
+    """ตอนเปิดบอท: สัปดาห์นี้ยังไม่เคยส่งปฏิทิน → ส่งเลย (เปิดคอมวันไหนก็ได้)"""
+    await _run_calendar(context, "startup earnings calendar")
+
+
 # ── ปุ่ม "➕ ติดตาม" ใต้ผลสแกน/สรุปงบ (กดแล้วเข้าลิสต์ทันที) ─────
 # รับได้ทั้ง dict ผลสแกน ({"ticker": ...}) และชื่อหุ้นเปล่าๆ (จากสรุปงบ)
 
@@ -1228,6 +1325,12 @@ async def daily_scan_job(context: ContextTypes.DEFAULT_TYPE):
                              reply_markup=buttons, parse_mode="HTML")
         except Exception:
             log.exception("send scan report failed (chat %s)", cid)
+    # อัปเดต cache ไม้เงาต่อท้ายสแกน — ให้ส่วนไม้เงาใน "สถิติ" สดวันต่อวัน
+    # โดยผู้ใช้ไม่ต้องพิมพ์ "เงา" เอง (ราคาที่ต้องใช้ส่วนใหญ่เพิ่งถูกดึงไปแล้ว)
+    try:
+        await asyncio.to_thread(shadow.update_shadow)
+    except Exception:
+        log.exception("shadow update after scan failed")
 
 
 def _parse_thai_date(s: str):
@@ -1589,6 +1692,146 @@ def record_sell(chat_id, ticker_input: str, price: float) -> str:
     return "\n".join(lines)
 
 
+# ── รายงานไม้เปิดประจำวัน (17:45 หลังสแกน) ──────────────────────
+# ทำส่วน "ถือต่อ/ลด" ของ workflow ให้อัตโนมัติ: R ปัจจุบัน + ระยะถึงเส้น ⛔
+# + นับวันเงียบ (กติกา: เงียบเกิน 5 วันทำการ = เริ่มพิจารณาลด) — เมื่อก่อน
+# ต้องเปิด "ลิสต์" แล้วนับเอง
+
+OPENPOS_HOUR, OPENPOS_MINUTE = 17, 45
+OPENPOS_QUIET_DAYS = 5       # ไม่ทำไฮใหม่เกินกี่วันทำการ = ⚠️ พิจารณาลด
+OPENPOS_NEAR_STOP_PCT = 2.0  # เหลือระยะถึงเส้น ⛔ ไม่เกินกี่ % = ⚠️ ใกล้โดนตัด
+
+
+def _open_trade_metrics(t):
+    """สถานะไม้เปิดหนึ่งไม้จากราคาย้อนหลังตั้งแต่วันเข้า (ยิง Yahoo ตัวละครั้ง)
+    คืน dict หรือ None ถ้าดึงราคาไม่ได้"""
+    try:
+        fetched = stock_core.fetch_history(t["symbol"], period="1y")
+    except Exception:
+        fetched = None
+    if fetched is None:
+        return None
+    _, hist = fetched
+    entry_day = t["datetime"].date()
+    since = hist[[d >= entry_day for d in hist.index.date]]
+    if since.empty:
+        return None
+    cur = float(since["Close"].iloc[-1])
+    # วันเงียบ = กี่วันทำการแล้วที่ไม่ทำไฮใหม่ (นับจากวันเข้า แบบเดียวกับ
+    # days_since_new_high ใน stock_core แต่ยึดช่วงถือจริงของไม้นี้)
+    highs = since["High"]
+    new_high_pos = (highs >= highs.cummax()).values.nonzero()[0]
+    quiet = len(highs) - 1 - int(new_high_pos[-1])
+    m = {"cur": cur, "pct": (cur - t["price"]) / t["price"] * 100,
+         "quiet": quiet, "r": None, "to_stop_pct": None, "hit_stop": False}
+    if t["stop"] is not None:
+        m["to_stop_pct"] = (cur - t["stop"]) / cur * 100  # ลงอีกกี่ % ถึงเส้น ⛔
+        m["hit_stop"] = cur <= t["stop"]
+        if t["price"] > t["stop"]:
+            m["r"] = (cur - t["price"]) / (t["price"] - t["stop"])
+    return m
+
+
+def _open_trade_lines(open_):
+    """บรรทัดสถานะไม้เปิด (ใช้ร่วมกันระหว่างรายงาน 17:45 กับคำสั่ง "เทรด")"""
+    lines = []
+    for t in sorted(open_, key=lambda x: x["datetime"]):
+        m = _open_trade_metrics(t)
+        sym = html.escape(t["symbol"])
+        if m is None:
+            lines.append(f"• <b>{sym}</b> ซื้อ {t['price']:,.2f} "
+                         f"({t['datetime']:%d/%m}) — ดึงราคาล่าสุดไม่ได้")
+            continue
+        r_txt = f"  <b>{m['r']:+.2f}R</b>" if m["r"] is not None else ""
+        lines.append(f"• <b>{sym}</b> {t['price']:,.2f} ({t['datetime']:%d/%m}) "
+                     f"→ {m['cur']:,.2f} ({m['pct']:+.1f}%){r_txt}")
+        detail = []
+        if m["hit_stop"]:
+            detail.append(f"⛔ หลุดเส้นตัด {t['stop']:,.2f} แล้ว — ทำตามเครื่อง ไม่ต่อรอง")
+        elif m["to_stop_pct"] is not None:
+            if m["to_stop_pct"] <= OPENPOS_NEAR_STOP_PCT:
+                detail.append(f"⚠️ เหลือ {m['to_stop_pct']:.1f}% ถึงเส้น ⛔ {t['stop']:,.2f}")
+            else:
+                detail.append(f"ห่างเส้น ⛔ {m['to_stop_pct']:.1f}%")
+        if m["quiet"] >= OPENPOS_QUIET_DAYS:
+            detail.append(f"⚠️ เงียบ {m['quiet']} วันทำการ "
+                          f"(เกิน {OPENPOS_QUIET_DAYS} = พิจารณาลด)")
+        elif m["quiet"] == 0:
+            detail.append("ทำไฮใหม่วันนี้ 🔥")
+        else:
+            detail.append(f"ไฮใหม่ล่าสุด {m['quiet']} วันก่อน")
+        if detail:
+            lines.append("   " + " • ".join(detail))
+    return lines
+
+
+def build_open_positions_report(chat_id) -> str:
+    """รายงานไม้เปิดประจำวันของ chat หนึ่ง — "" ถ้าไม่มีไม้เปิด (ไม่ส่ง)"""
+    _, open_ = stock_core.pair_trades(stock_core.load_trades(chat_id))
+    if not open_:
+        return ""
+    lines = [f"📂 <b>ไม้ที่เปิดอยู่ ({len(open_)})</b> — เช็คประจำวันหลังปิดตลาด"]
+    lines += _open_trade_lines(open_)
+    lines.append("")
+    lines.append("ปิดไม้เมื่อไหร่จด: <code>ขาย XXX ราคา</code> • ดูไม้ปิดแล้ว: <code>เทรด</code>")
+    return "\n".join(lines)
+
+
+# กันส่งซ้ำแบบเดียวกับสรุปงบเช้า (key "openpos_last_sent") + ธง in-flight
+_openpos_in_flight = False
+
+
+async def _run_open_positions(context: ContextTypes.DEFAULT_TYPE, label: str):
+    """ตัวส่งรายงานไม้เปิดกลาง: ครั้งเดียวต่อวัน — ไม่มีไม้เปิด = ไม่ส่ง"""
+    global _openpos_in_flight
+    now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
+    if now.weekday() >= 5 or _is_market_holiday(now.date()):
+        return
+    if _openpos_in_flight:
+        return
+    if _load_digest_state().get("openpos_last_sent") == now.date().isoformat():
+        return
+    chat_ids = _load_chat_ids()
+    if not chat_ids:
+        return
+    _openpos_in_flight = True
+    try:
+        sent_any = False
+        for cid in chat_ids:
+            try:
+                text = await asyncio.to_thread(build_open_positions_report, cid)
+            except Exception:
+                log.exception("%s failed (chat %s)", label, cid)
+                continue
+            if not text:
+                continue
+            try:
+                await _send_long(context.bot, cid, text, parse_mode="HTML")
+                sent_any = True
+            except Exception:
+                log.exception("send %s failed (chat %s)", label, cid)
+        if sent_any:
+            state = _load_digest_state()
+            state["openpos_last_sent"] = now.date().isoformat()
+            _save_digest_state(state)
+    finally:
+        _openpos_in_flight = False
+
+
+async def open_positions_job(context: ContextTypes.DEFAULT_TYPE):
+    """job รายวัน 17:45: สถานะไม้เปิดหลังปิดตลาด (ต่อจากสแกน 17:30)"""
+    await _run_open_positions(context, "open positions")
+
+
+async def startup_openpos_job(context: ContextTypes.DEFAULT_TYPE):
+    """ตอนเปิดบอท: ถ้าเลย 17:45 มาแล้ววันนี้ยังไม่ได้ส่ง (เปิดคอมตอนค่ำ)
+    → ส่งชดเชย (ก่อน 17:45 ปล่อยให้ job ปกติทำงาน)"""
+    now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
+    if now.time() < datetime.time(OPENPOS_HOUR, OPENPOS_MINUTE):
+        return
+    await _run_open_positions(context, "startup open positions")
+
+
 def build_trades_report(chat_id) -> str:
     """คำสั่ง "เทรด": ไม้ที่เปิดอยู่ (พร้อมกำไรลอยตัว) + ไม้ปิดล่าสุด"""
     rows = stock_core.load_trades(chat_id)
@@ -1603,22 +1846,7 @@ def build_trades_report(chat_id) -> str:
 
     if open_:
         lines.append(f"📂 <b>ไม้ที่เปิดอยู่</b> ({len(open_)})")
-        for t in sorted(open_, key=lambda x: x["datetime"]):
-            try:
-                d = stock_core.get_stock_data(t["symbol"])
-            except Exception:
-                d = None
-            cur = f"ตอนนี้ {d['price']:,.2f} ({(d['price'] - t['price']) / t['price'] * 100:+.1f}%)" \
-                if d is not None else "ดึงราคาล่าสุดไม่ได้"
-            stop_txt = ""
-            if t["stop"] is not None:
-                stop_txt = f" ⛔ {t['stop']:,.2f}"
-                if d is not None and d["price"] <= t["stop"]:
-                    stop_txt += " — หลุดแล้ว!"
-            lines.append(
-                f"• <b>{html.escape(t['symbol'])}</b> "
-                f"ซื้อ {t['price']:,.2f} ({t['datetime']:%d/%m}) → {cur}{stop_txt}"
-            )
+        lines += _open_trade_lines(open_)
         lines.append("")
 
     if closed:
@@ -1711,6 +1939,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                           reply_markup=_watch_buttons(hot), parse_mode="HTML")
         return
 
+    # ไม้เงา: "เงา" — ระบบเทรดกระดาษเองจากผลสแกน (พิสูจน์คะแนนด้วยข้อมูล forward)
+    if len(tickers) == 1 and tickers[0].lower() in ("เงา", "shadow"):
+        await update.message.reply_text(
+            "⏳ กำลังอัปเดตไม้เงาจาก scan_log.csv (ยิงราคาเฉพาะไม้ที่ยังเปิด)..."
+        )
+        result = await asyncio.to_thread(shadow.build_shadow_report)
+        await _reply_long(update.message, result, parse_mode="HTML")
+        return
+
     # สถิติย้อนหลังจาก scan_log.csv: "สถิติ"
     if len(tickers) == 1 and tickers[0].lower() in ("สถิติ", "stats"):
         await update.message.reply_text(
@@ -1719,6 +1956,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await asyncio.to_thread(
             stats.build_stats_report, True, update.effective_chat.id
         )
+        await _reply_long(update.message, result, parse_mode="HTML")
+        return
+
+    # ปฏิทินงบล่วงหน้า: "ปฏิทิน" — อ่านจากคลังในเครื่อง ตอบได้ทันที
+    if len(tickers) == 1 and tickers[0].lower() in ("ปฏิทิน", "calendar"):
+        result = build_earnings_calendar(update.effective_chat.id)
+        if not result:
+            result = (
+                f"📭 ไม่รู้วันงบของตัวไหนใน {CALENDAR_DAYS_AHEAD} วันข้างหน้าครับ\n"
+                "คลังวันงบมีเฉพาะตัวที่บอทเคยเห็น — บันทึกเองได้: "
+                "<code>งบ XXXX 14/08/2569</code>"
+            )
         await _reply_long(update.message, result, parse_mode="HTML")
         return
 
@@ -1943,7 +2192,11 @@ def main():
     print(f"  สรุปงบเช้าทุกวันทำการ เวลา {DIGEST_HOUR:02d}:{DIGEST_MINUTE:02d} น. "
           "(หรือส่งตอนเปิดบอทถ้ายังไม่ได้ส่ง)")
     print(f"  ยืนยันรอบเช้าทุกวันทำการ เวลา {CONFIRM_HOUR:02d}:{CONFIRM_MINUTE:02d} น. "
-          "(เฉพาะวันที่มีหุ้นงบโตแรง)\n")
+          "(เฉพาะวันที่มีหุ้นงบโตแรง)")
+    print(f"  รายงานไม้เปิดทุกวันทำการ เวลา {OPENPOS_HOUR:02d}:{OPENPOS_MINUTE:02d} น. "
+          "(เฉพาะวันที่มีไม้เปิด)")
+    print(f"  ปฏิทินงบสัปดาห์ละครั้ง เวลา {CALENDAR_HOUR:02d}:{CALENDAR_MINUTE:02d} น. "
+          "(ปกติเย็นวันอาทิตย์)\n")
     log.info("bot starting")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1981,6 +2234,18 @@ def main():
         time=datetime.time(CONFIRM_HOUR, CONFIRM_MINUTE,
                            tzinfo=ZoneInfo("Asia/Bangkok")),
     )
+    app.job_queue.run_daily(
+        open_positions_job,
+        time=datetime.time(OPENPOS_HOUR, OPENPOS_MINUTE,
+                           tzinfo=ZoneInfo("Asia/Bangkok")),
+    )
+    # ปฏิทินงบเป็นรายสัปดาห์ แต่ลง job รายวัน 19:00 — anchor วันอาทิตย์ล่าสุด
+    # ใน digest_state ทำให้ส่งจริงครั้งเดียวต่อสัปดาห์ วันไหนก็ได้ที่คอมเปิดก่อน
+    app.job_queue.run_daily(
+        calendar_job,
+        time=datetime.time(CALENDAR_HOUR, CALENDAR_MINUTE,
+                           tzinfo=ZoneInfo("Asia/Bangkok")),
+    )
     # จดเวลาว่ายังทำงานทุก 5 นาที + เก็บตกข่าวช่วงที่ปิดไป (ครั้งเดียวตอนเปิด)
     app.job_queue.run_repeating(alive_job, interval=300, first=10)
     app.job_queue.run_once(startup_catchup_job, when=20)
@@ -1992,6 +2257,10 @@ def main():
     # เตือนวันงบตามหลังอีกขั้น (เผื่อเปิดคอมหลัง 08:45 — ยิง Yahoo ทีละตัวในลิสต์
     # จึงให้ job อื่นที่รีบกว่าไปก่อน)
     app.job_queue.run_once(startup_reminder_job, when=360)
+    # ไม้เปิดชดเชยตอนเปิดคอมค่ำ (เงื่อนไขหลัง 17:45 อยู่ใน job)
+    app.job_queue.run_once(startup_openpos_job, when=390)
+    # ปฏิทินงบชดเชย — อ่านจากคลังในเครื่อง ไม่ยิงเครือข่าย วางท้ายสุดพอ
+    app.job_queue.run_once(startup_calendar_job, when=420)
     # ย้าย watchlist.json format เดิม (list) → per-user dict ให้เจ้าของ (ครั้งเดียว)
     stock_core.migrate_legacy_watchlist(_load_chat_ids())
     app.run_polling(drop_pending_updates=True)
