@@ -54,12 +54,12 @@ backtest.py           ← จำลองระบบคะแนนกับว
 | เวลา | job |
 |---|---|
 | 07:00-09:45 และ 17:00-21:45 ทุก 10 นาที | poll ข่าวแจ้งงบจากเว็บ SET |
-| 08:30 | heartbeat "✅ บอททำงานปกติ" |
+| 08:30 | heartbeat "✅ บอททำงานปกติ" — ครั้งเดียวต่อวัน (key `alive_last_sent`) + startup fallback (หน่วง 25 วิ): เครื่องบูตสาย/รีสตาร์ทก็ยังได้ ✅ ของวันนั้น |
 | 08:45 | เตือนหุ้นใน watchlist ที่งบออกวันนี้/พรุ่งนี้ — มี startup fallback (หน่วง 360 วิ, ก่อน 16:30) แบบเดียวกับสรุปงบเช้า |
 | 08:55 | สรุปงบเช้า — รวบหุ้นแจ้งงบตั้งแต่เย็นวาน+เช้านี้เป็นข้อความเดียว |
 | 10:30 | ยืนยันรอบเช้า — หุ้นงบโตแรงเมื่อคืน แบ่ง ✅ ตลาดยืนยัน / 😐 / ❌ ตัดทิ้ง ตาม %วันนี้+วอลุ่มสะสม (ไม่มีตัวโตแรง = ไม่ส่ง) |
 | 10:00-17:00 ทุก 15 นาที | เช็ค watchlist — เด้งเฉพาะตอนสถานะเปลี่ยน (🔥 ทะลุไฮ 3 ด. / 📈 ไฮใหม่ / ⛔ หลุด Low ก่อนงบ) |
-| 17:30 | สแกนอัตโนมัติหลังปิดตลาด — จบแล้วอัปเดต cache ไม้เงา (`shadow.update_shadow`) ต่อท้าย |
+| 17:30 | สแกนอัตโนมัติหลังปิดตลาด — จบแล้วอัปเดต cache ไม้เงา (`shadow.update_shadow`) ต่อท้าย — ครั้งเดียวต่อวัน (key `scan_last_run`) + startup fallback (หน่วง 450 วิ, เฉพาะหลัง 17:30): เปิดคอมค่ำก็ไม่เกิดรูใน scan_log/ไม้เงา |
 | 17:45 | รายงานไม้เปิด (เฉพาะ chat ที่มีไม้จริงเปิด): R ปัจจุบัน / % ถึงเส้น ⛔ / วันเงียบ + ⚠️ ตามกติกา workflow — มี startup fallback (หน่วง 390 วิ, เฉพาะหลัง 17:45) |
 | อาทิตย์ 19:00 (job รายวัน) | ปฏิทินงบ 14 วันข้างหน้า จาก `stock_core.upcoming_earnings()` — กันซ้ำรายสัปดาห์ด้วย anchor "วันอาทิตย์ล่าสุด" (key `calendar_last_sent`) จึงลงเป็น job รายวัน + startup fallback (หน่วง 420 วิ): คอมปิดวันอาทิตย์ก็ส่งชดเชยครั้งแรกที่เปิดในสัปดาห์นั้น |
 | ตอนเปิดบอท | startup catch-up: ดูจากอายุข้อมูลข่าว (mtime ของ `news_seen.json` — ห้ามใช้ `last_alive.json` เพราะโดน alive_job เขียนทับก่อน catch-up อ่าน) ถ้าเก่าเกิน 20 ชม. ดึงข่าวย้อนหลัง (สูงสุด 7 วัน) มาเก็บตกวันงบ |
@@ -79,6 +79,7 @@ backtest.py           ← จำลองระบบคะแนนกับว
 เว็บ SET มีระบบกันบอท (Incapsula) — ต้องเปิด Chromium จริงผ่าน Playwright แล้ว**ดัก request ของ SPA เองมา rewrite query** (fromDate/toDate/perPage) เพราะยิง API ตรงๆ โดน 401 ถ้าเว็บ SET เปลี่ยนโครงสร้าง โมดูลนี้คือที่แรกที่พัง ข้อผิดพลาดต้องไม่ทำให้บอทหลักล้ม (โยน exception ให้ผู้เรียกจัดการ)
 
 - `check_new_earnings_news()` นอกจากบันทึกวันงบ/ตัวเลข F45 แล้ว ยังต่อท้าย `filings_log.csv` (ทุกข่าวงบที่ยังไม่เคยเห็น — ดิบกว่า `earnings_results.csv` เพราะเก็บแม้ตัวที่อ่านตัวเลขไม่ได้) ใช้เป็นแหล่งข้อมูลของ "สรุปงบเช้า"
+- อ่านรายละเอียด F45 ได้สูงสุด `F45_DETAIL_MAX` (15) ฉบับต่อรอบ — ตัวที่เกินโควตา/โหลดหน้าไม่สำเร็จเข้าคิว `f45_backlog.json` แล้วทยอยอ่านด้วยโควตาที่เหลือของรอบถัดๆ ไปจนหมด (ตัวเลขจากคิวลง `earnings_results.csv` อย่างเดียว ไม่แจ้งเตือนซ้ำ — คิวเก็บ 7 วัน ลองซ้ำได้ 3 ครั้ง)
 - `load_results_since(dt)` / `load_filings_since(dt)` อ่านย้อนหลังจาก CSV ล้วนๆ (ไม่ยิง Playwright) ให้ `build_morning_digest` ใน telegram_bot.py — ไฟล์ไม่มี/แถวเสียต้องคืนค่าว่าง ห้ามโยน exception
 
 ### scanner.py — สามโหมด (เลือกอัตโนมัติผ่าน `run_best_scan` ใน telegram_bot)
@@ -89,11 +90,15 @@ backtest.py           ← จำลองระบบคะแนนกับว
 
 ทุกโหมดเขียน `scan_log.csv` schema เดียวกัน — เทียบสถิติก่อน/หลังเปลี่ยนวิธีได้จากคอลัมน์ `scan_date` (จุดตัด 2026-07-12) ฝั่ง `news_monitor_job` มี self-healing: คำนวณ `days_back` จากอายุข้อมูลข่าว เพื่อไม่ให้ `filings_log.csv` มีรูช่วงเว็บล่มข้ามวันขณะบอทเปิดอยู่ (สแกนโหมดหลักพึ่งความครบของไฟล์นี้)
 
+ทุกโหมดดึงข้อมูลผ่าน `_fetch_all`: โดน Yahoo rate limit กลางคันพักครั้งเดียว (`RATE_LIMIT_PAUSE_S`) แล้วไล่ต่อจากตัวเดิม — โดนซ้ำถือว่าโควตาหมด ตัวที่เหลือคืนเป็น `rate_limited` แสดงแยกท้ายรายงาน (ไม่ปนกับ "ไม่มีข้อมูล" และไม่หายเงียบ)
+
 ## ไฟล์ข้อมูล/สถานะ (gitignore ทั้งหมด — อย่า commit)
 
-`.env` (BOT_TOKEN), `watchlist.json`, `chat_ids.json`, `news_seen.json`, `last_alive.json`, `watch_state.json`, `scan_log.csv`, `lookup_log.csv`, `backtest_results.csv`, `bot_log.txt`, `.yf_cache/`, `filings_log.csv` (ใครแจ้งงบเมื่อไหร่ — ดิบกว่า earnings_results.csv รวมตัวที่อ่านตัวเลขไม่ได้ด้วย), `digest_state.json` (กันส่งรายงานอัตโนมัติซ้ำ — key รายวัน `last_sent` / `confirm_last_sent` / `remind_last_sent` / `openpos_last_sent` + รายสัปดาห์ `calendar_last_sent` เก็บ anchor วันอาทิตย์ล่าสุด), `port_settings.json` (ขนาดพอร์ตต่อ chat สำหรับคำนวณขนาดไม้), `trades_log.csv` (บันทึกไม้จริง — append-only เหมือน scan_log), `shadow_log.csv` (ไม้เงาที่ปิดแล้ว — cache สร้างใหม่ได้เสมอจาก scan_log)
+`.env` (BOT_TOKEN), `watchlist.json`, `chat_ids.json`, `news_seen.json`, `last_alive.json`, `watch_state.json`, `scan_log.csv`, `lookup_log.csv`, `backtest_results.csv`, `bot_log.txt`, `.yf_cache/`, `filings_log.csv` (ใครแจ้งงบเมื่อไหร่ — ดิบกว่า earnings_results.csv รวมตัวที่อ่านตัวเลขไม่ได้ด้วย), `digest_state.json` (กันส่งรายงานอัตโนมัติซ้ำ — key รายวัน `last_sent` / `confirm_last_sent` / `remind_last_sent` / `openpos_last_sent` / `alive_last_sent` / `scan_last_run` + รายสัปดาห์ `calendar_last_sent` เก็บ anchor วันอาทิตย์ล่าสุด), `port_settings.json` (ขนาดพอร์ตต่อ chat สำหรับคำนวณขนาดไม้), `trades_log.csv` (บันทึกไม้จริง — append-only เหมือน scan_log), `shadow_log.csv` (ไม้เงาที่ปิดแล้ว — cache สร้างใหม่ได้เสมอจาก scan_log), `f45_backlog.json` (คิว F45 ที่ยังไม่ได้อ่านตัวเลข — วันพีคเกินโควตาต่อรอบ)
 
 ไฟล์ log แบบ append (scan_log, lookup_log) คือข้อมูลสะสมที่ใช้วิเคราะห์ย้อนหลัง — เปลี่ยน schema คอลัมน์ต้องระวังไฟล์เก่าที่มีอยู่
+
+ไฟล์สถานะ JSON ทุกไฟล์เขียนผ่าน `stock_core.save_json_atomic` (เขียน .tmp แล้ว os.replace — ไฟดับกลางคันไฟล์เดิมยังอยู่) และไฟล์สำคัญ (chat_ids, watchlist, คลังวันงบ) อ่านผ่าน `stock_core.load_json_or_backup` (ไฟล์เสียถูกเก็บเป็น `.bak` ไว้กู้ ไม่ทับทิ้งเงียบๆ) — เขียนโค้ดใหม่ที่แตะไฟล์สถานะให้ใช้คู่นี้เสมอ
 
 ## เอกสารประกอบ (ต้องอัปเดตให้ตรงเมื่อแก้พฤติกรรมระบบ)
 

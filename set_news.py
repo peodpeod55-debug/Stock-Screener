@@ -335,11 +335,58 @@ def _log_filing(news_datetime, symbol, kinds):
         pass  # ไฟล์เปิดค้างใน Excel ฯลฯ — อย่าให้ล้มการแจ้งเตือน
 
 
+# ── คิว F45 ที่ยังไม่ได้อ่านตัวเลข (วันพีคเกินโควตาต่อรอบ) ──────
+# เดิมข่าวถูก mark "เห็นแล้ว" ทันทีแต่อ่านรายละเอียดได้แค่ F45_DETAIL_MAX
+# ฉบับ/รอบ → ตัวที่เกินไม่มีวันได้ตัวเลข (ไม่เข้าสรุปงบเช้า/ยืนยันรอบเช้า)
+# แก้ด้วยคิวถาวร: ตัวที่เกิน (หรือโหลดหน้าไม่สำเร็จ) เข้าคิวไว้ทยอยอ่าน
+# รอบถัดไปจนหมด — ตัวเลขแค่มาช้า ไม่หายอีก
+
+_F45_BACKLOG_PATH = os.path.join(_BASE_DIR, "f45_backlog.json")
+F45_BACKLOG_MAX_TRIES = 3   # โหลดหน้าล้มเหลวได้กี่ครั้งก่อนตัดทิ้ง (ลิงก์ตาย)
+F45_BACKLOG_MAX_DAYS = 7    # เก็บคิวไว้นานสุดกี่วัน (เท่ากรอบ news_seen)
+
+
+def _load_f45_backlog():
+    try:
+        with open(_F45_BACKLOG_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_f45_backlog(backlog):
+    # ตัดตัวที่เก่าเกินกรอบ / ลองครบโควตาแล้ว ออกตอนบันทึก
+    cutoff = (datetime.datetime.now(_BKK)
+              - datetime.timedelta(days=F45_BACKLOG_MAX_DAYS)).isoformat()
+    pruned = {sym: it for sym, it in backlog.items()
+              if it.get("datetime", "") >= cutoff
+              and it.get("tries", 0) < F45_BACKLOG_MAX_TRIES}
+    try:
+        stock_core.save_json_atomic(_F45_BACKLOG_PATH, pruned)
+    except Exception:
+        pass
+
+
+def _backlog_put(backlog, sym, url, dt, failed=False):
+    """เพิ่ม/อัปเดตหุ้นในคิว — ฉบับใหม่สุดชนะ (บริษัทยื่นแก้ไขได้)
+    failed=True คือเพิ่งโหลดหน้าไม่สำเร็จ → นับครั้งไว้ตัดตอนครบโควตา"""
+    item = backlog.setdefault(sym, {"tries": 0})
+    item["url"] = url
+    item["datetime"] = dt.isoformat()
+    if failed:
+        item["tries"] = item.get("tries", 0) + 1
+
+
 def _attach_f45_summaries(by_symbol):
     """เติมสรุปตัวเลข F45 ("f45"/"f45_data") ให้หุ้นที่มีข่าว F45
-    และบันทึกตัวเลขลง earnings_results.csv"""
+    และบันทึกตัวเลขลง earnings_results.csv
+
+    โควตาที่เหลือในรอบ (วันเงียบ) ใช้ล้างคิว f45_backlog ของรอบก่อนๆ
+    — ตัวเลขจากคิวลง earnings_results.csv อย่างเดียว (แจ้งเตือนของมัน
+    ผ่านไปแล้วตอนข่าวเข้าครั้งแรก)"""
     targets = {sym: e["f45_url"] for sym, e in by_symbol.items() if e.get("f45_url")}
-    if not targets:
+    backlog = _load_f45_backlog()
+    if not targets and not backlog:
         return
     # จัดคิวเมื่อวันพีคเกินโควตา: หุ้นในลิสต์ติดตาม/universe ได้อ่านก่อน
     # ที่เหลือเรียงตามเวลาข่าวใหม่สุด (union ทุกคน — เป็นแค่ลำดับความสำคัญ)
@@ -350,20 +397,52 @@ def _attach_f45_summaries(by_symbol):
         key=lambda s: (0 if (s in watch or s in uni) else 1,
                        -by_symbol[s]["datetime"].timestamp()),
     )
-    urls = [targets[s] for s in ordered[:F45_DETAIL_MAX]]
+    take = ordered[:F45_DETAIL_MAX]
+    for sym in ordered[F45_DETAIL_MAX:]:  # เกินโควตารอบนี้ → เข้าคิว
+        _backlog_put(backlog, sym, targets[sym], by_symbol[sym]["datetime"])
+    # โควตาที่เหลือหยิบจากคิวเก่ามาอ่าน — ข้ามตัวที่อ่านรอบนี้อยู่แล้ว
+    spare = [s for s in backlog
+             if s not in targets][: max(0, F45_DETAIL_MAX - len(take))]
+    urls = ([targets[s] for s in take]
+            + [backlog[s]["url"] for s in spare])
+    if not urls:
+        _save_f45_backlog(backlog)
+        return
     try:
         details = fetch_news_details(urls)
     except Exception:
+        _save_f45_backlog(backlog)  # คิวที่เพิ่งเพิ่มต้องไม่หาย
         return  # อ่านรายละเอียดไม่ได้ ไม่เป็นไร — แจ้งเตือนแบบไม่มีตัวเลขแทน
-    for sym in ordered[:F45_DETAIL_MAX]:
+    for sym in take:
         text = details.get(targets[sym])
         if not text:
+            # โหลดหน้าไม่สำเร็จ → เข้าคิวลองใหม่รอบหน้า
+            _backlog_put(backlog, sym, targets[sym], by_symbol[sym]["datetime"],
+                         failed=True)
             continue
+        backlog.pop(sym, None)  # ได้เนื้อหาแล้ว — พ้นคิว (parse ไม่ได้ก็ไม่ลองซ้ำ)
         parsed = parse_f45(text)
         if parsed:
             by_symbol[sym]["f45"] = format_f45_summary(parsed)
             by_symbol[sym]["f45_data"] = parsed
             _log_f45_result(by_symbol[sym])
+    for sym in spare:
+        item = backlog[sym]
+        text = details.get(item["url"])
+        if not text:
+            item["tries"] = item.get("tries", 0) + 1
+            continue
+        del backlog[sym]
+        parsed = parse_f45(text)
+        if parsed:
+            try:
+                dt = datetime.datetime.fromisoformat(item["datetime"])
+            except (KeyError, ValueError):
+                dt = datetime.datetime.now(_BKK)
+            _log_f45_result({"symbol": sym, "datetime": dt,
+                             "f45": format_f45_summary(parsed),
+                             "f45_data": parsed})
+    _save_f45_backlog(backlog)
 
 
 # ── แยกประเภทข่าว "งบออกแล้ว" ───────────────────────────────────
@@ -399,8 +478,7 @@ def _save_seen(seen):
     cutoff = (datetime.datetime.now(_BKK) - datetime.timedelta(days=7)).isoformat()
     pruned = {k: v for k, v in seen.items() if v >= cutoff}
     try:
-        with open(_SEEN_PATH, "w", encoding="utf-8") as f:
-            json.dump(pruned, f, ensure_ascii=False, indent=1)
+        stock_core.save_json_atomic(_SEEN_PATH, pruned)
     except Exception:
         pass
 

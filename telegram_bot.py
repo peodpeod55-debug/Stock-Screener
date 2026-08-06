@@ -1,4 +1,5 @@
 import os
+import re
 import html
 import json
 import time
@@ -11,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from yfinance.exceptions import YFRateLimitError
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import NetworkError
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -102,6 +104,25 @@ async def _send_long(bot, chat_id: int, text: str, reply_markup=None, **kwargs):
     for i, part in enumerate(parts):
         markup = reply_markup if i == len(parts) - 1 else None
         await bot.send_message(chat_id, part, reply_markup=markup, **kwargs)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """error handler กลางของ PTB — เดิมไม่มีเลย ทำให้ (1) คำสั่งที่พังกลางทาง
+    ผู้ใช้ค้างที่ "⏳..." เงียบๆ (2) log เต็มไปด้วย "No error handlers are
+    registered" พร้อม traceback ยาวจากเน็ตสะดุดชั่วคราว"""
+    err = getattr(context, "error", None)
+    # เน็ตสะดุดระหว่าง polling เกิดเป็นระยะอยู่แล้ว — log สั้นๆ พอ ไม่ต้องเต็ม traceback
+    if isinstance(err, NetworkError) and not isinstance(update, Update):
+        log.warning("network hiccup: %s", err)
+        return
+    log.error("unhandled error", exc_info=err)
+    msg = getattr(update, "effective_message", None)
+    if msg is not None:
+        try:
+            await msg.reply_text("⚠️ เกิดข้อผิดพลาดระหว่างประมวลผล "
+                                 "ลองใหม่อีกครั้งนะครับ")
+        except Exception:
+            pass
 
 
 # ── วันหยุดตลาด (ไม่บังคับ): ใส่วันที่ใน holidays.txt บรรทัดละวัน ──
@@ -322,11 +343,9 @@ _CHAT_IDS_PATH = os.path.join(_BASE_DIR, "chat_ids.json")
 
 
 def _load_chat_ids():
-    try:
-        with open(_CHAT_IDS_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
+    # ไฟล์เสีย = ทุก job เงียบทั้งบอท (early-return หมด) — เก็บ .bak ไว้กู้
+    ids = stock_core.load_json_or_backup(_CHAT_IDS_PATH, [])
+    return ids if isinstance(ids, list) else []
 
 
 def _register_chat(chat_id: int):
@@ -334,8 +353,7 @@ def _register_chat(chat_id: int):
     if chat_id not in ids:
         ids.append(chat_id)
         try:
-            with open(_CHAT_IDS_PATH, "w", encoding="utf-8") as f:
-                json.dump(ids, f)
+            stock_core.save_json_atomic(_CHAT_IDS_PATH, ids)
         except Exception:
             pass
 
@@ -358,8 +376,9 @@ CATCHUP_MAX_DAYS = 7         # เก็บตกย้อนได้ลึก�
 
 def _write_alive():
     try:
-        with open(_ALIVE_PATH, "w", encoding="utf-8") as f:
-            json.dump({"ts": datetime.datetime.now(ZoneInfo("Asia/Bangkok")).isoformat()}, f)
+        stock_core.save_json_atomic(
+            _ALIVE_PATH,
+            {"ts": datetime.datetime.now(ZoneInfo("Asia/Bangkok")).isoformat()})
     except Exception:
         pass
 
@@ -409,20 +428,41 @@ async def startup_catchup_job(context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
-    """ส่งสั้นๆ ทุกเช้าวันทำการว่ายังมีชีวิต — เช้าไหนไม่มีข้อความนี้
-    = บอทตายอยู่ ให้ไปเปิดใหม่"""
+async def _run_heartbeat(context: ContextTypes.DEFAULT_TYPE):
+    """ส่ง "✅ บอททำงานปกติ" ครั้งเดียวต่อวันทำการ (key ใน digest_state)
+
+    เดิมมีแต่ job 08:30 ซึ่งเครื่องผู้ใช้บูต ~09:30 จึงแทบไม่เคยยิง —
+    วันปกติเลยไม่มีข้อความทั้งที่บอทดีๆ ทำสัญญาณ "ไม่เห็น ✅ = บอทตาย"
+    กลับด้านพอดี → เพิ่มทางยิงตอนเปิดบอท: เปิดเครื่องแล้วต้องเห็น ✅ เสมอ"""
     now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
     if now.weekday() >= 5:
         return
+    if _load_digest_state().get("alive_last_sent") == now.date().isoformat():
+        return
+    sent_any = False
     for cid in _load_chat_ids():
         n_watch = len(stock_core.get_watchlist(cid))
         text = (f"✅ บอททำงานปกติ • ลิสต์ติดตาม {n_watch} ตัว • "
                 f"สแกนอัตโนมัติ {SCAN_HOUR:02d}:{SCAN_MINUTE:02d} น.")
         try:
             await context.bot.send_message(cid, text)
+            sent_any = True
         except Exception:
             pass
+    if sent_any:
+        state = _load_digest_state()
+        state["alive_last_sent"] = now.date().isoformat()
+        _save_digest_state(state)
+
+
+async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
+    """job รายวัน 08:30 (ยิงจริงเฉพาะวันที่เครื่องเปิดอยู่ก่อนเวลานั้น)"""
+    await _run_heartbeat(context)
+
+
+async def startup_heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
+    """ตอนเปิดบอท: วันทำการไหนยังไม่ได้ส่ง ✅ ส่งทันที (เครื่องบูตสาย/รีสตาร์ท)"""
+    await _run_heartbeat(context)
 
 
 # ── เฝ้าข่าว "แจ้งผลประกอบการ" จากเว็บ SET ──────────────────────
@@ -578,8 +618,7 @@ def _load_digest_state():
 
 def _save_digest_state(state):
     try:
-        with open(_DIGEST_STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=1)
+        stock_core.save_json_atomic(_DIGEST_STATE_PATH, state)
     except Exception:
         pass
 
@@ -736,15 +775,21 @@ async def _run_morning_digest(context: ContextTypes.DEFAULT_TYPE, label: str):
         if not text:
             return
         buttons = _watch_buttons(hot)
+        sent_any = False
         for cid in chat_ids:
             try:
                 await _send_long(context.bot, cid, text,
                                  reply_markup=buttons, parse_mode="HTML")
+                sent_any = True
             except Exception:
                 log.exception("send %s failed (chat %s)", label, cid)
-        state = _load_digest_state()
-        state["last_sent"] = now.date().isoformat()
-        _save_digest_state(state)
+        # บันทึก "ส่งแล้ว" เฉพาะเมื่อส่งถึงจริงอย่างน้อยหนึ่ง chat —
+        # ไม่งั้นเน็ตล่มตอน 08:55 = วันนั้นถูกนับว่าส่งแล้วทั้งที่ไม่มีใครได้
+        # และ startup fallback จะไม่ยอมส่งซ้ำ
+        if sent_any:
+            state = _load_digest_state()
+            state["last_sent"] = now.date().isoformat()
+            _save_digest_state(state)
     finally:
         _digest_in_flight = False
 
@@ -901,15 +946,19 @@ async def _run_morning_confirm(context: ContextTypes.DEFAULT_TYPE, label: str):
         if not text:
             return
         buttons = _watch_buttons(hot)
+        sent_any = False
         for cid in chat_ids:
             try:
                 await _send_long(context.bot, cid, text,
                                  reply_markup=buttons, parse_mode="HTML")
+                sent_any = True
             except Exception:
                 log.exception("send %s failed (chat %s)", label, cid)
-        state = _load_digest_state()
-        state["confirm_last_sent"] = now.date().isoformat()
-        _save_digest_state(state)
+        # ส่งถึงจริงอย่างน้อยหนึ่ง chat ค่อยนับว่าส่งแล้ว (เหตุผลเดียวกับ digest)
+        if sent_any:
+            state = _load_digest_state()
+            state["confirm_last_sent"] = now.date().isoformat()
+            _save_digest_state(state)
     finally:
         _confirm_in_flight = False
 
@@ -947,8 +996,7 @@ def _load_watch_state():
 
 def _save_watch_state(state):
     try:
-        with open(_WATCH_STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=1)
+        stock_core.save_json_atomic(_WATCH_STATE_PATH, state)
     except Exception:
         pass
 
@@ -985,24 +1033,25 @@ def check_watchlist_changes():
             price_txt = (f"ราคา {d['price']:.2f} "
                          f"({format_signed_pct(d['day_change_pct'])} วันนี้)")
             msgs = []
+            sym_h = html.escape(sym)  # กันอักขระแปลกในลิสต์เก่าพังทั้งข้อความรวม
             if prev.get("above_pre_low", True) and not cur["above_pre_low"]:
                 msgs.append(
-                    f"⛔ <b>{sym}</b> หลุด Low ก่อนงบ "
+                    f"⛔ <b>{sym_h}</b> หลุด Low ก่อนงบ "
                     f"(<code>{s['pre_earn_low']:.2f}</code>) — สัญญาณเสีย\n{price_txt}"
                 )
             if not prev.get("broke_pre3m_high") and cur["broke_pre3m_high"]:
                 msgs.append(
-                    f"🔥 <b>{sym}</b> ทะลุไฮ 3 เดือนก่อนงบ "
+                    f"🔥 <b>{sym_h}</b> ทะลุไฮ 3 เดือนก่อนงบ "
                     f"(<code>{s['pre3m_high']:.2f}</code>) แล้ว\n{price_txt}"
                 )
             elif not prev.get("broke_pre5d_high") and cur["broke_pre5d_high"]:
                 msgs.append(
-                    f"✅ <b>{sym}</b> ผ่านไฮ 5 วันก่อนงบ "
+                    f"✅ <b>{sym_h}</b> ผ่านไฮ 5 วันก่อนงบ "
                     f"(<code>{s['pre5d_high']:.2f}</code>) แล้ว\n{price_txt}"
                 )
             if (not msgs and s["days_since_new_high"] == 0
                     and prev.get("new_high_date") != today):
-                msgs.append(f"📈 <b>{sym}</b> ทำไฮใหม่หลังงบวันนี้\n{price_txt}")
+                msgs.append(f"📈 <b>{sym_h}</b> ทำไฮใหม่หลังงบวันนี้\n{price_txt}")
             if msgs:
                 alerts[sym] = msgs
         state[sym] = cur
@@ -1057,7 +1106,8 @@ def build_earnings_reminder(chat_id):
         days = d["days_to_earnings"]
         if days is not None and 0 <= days <= 1:
             when = "วันนี้" if days == 0 else "พรุ่งนี้"
-            soon.append(f"• <b>{sym}</b> งบออก{when} ({d['next_earnings']:%d/%m/%Y})")
+            soon.append(f"• <b>{html.escape(sym)}</b> งบออก{when} "
+                        f"({d['next_earnings']:%d/%m/%Y})")
     if not soon:
         return None
     return "🗓 <b>เตือนวันประกาศงบ (หุ้นในลิสต์)</b>\n" + "\n".join(soon)
@@ -1285,52 +1335,95 @@ def run_best_scan():
     (แม่น + ไม่พึ่งความสดของ parquet) — ถอยโหมดเดิมเฉพาะตอนข้อมูลข่าว
     ไม่สด เช่นดึงข่าวเว็บ SET ล้มต่อเนื่อง (fail open: ข่าวล่มยังสแกนได้)
 
-    คืน (hits, scanned_count, source_note, unknowns, unknowns_title)"""
+    คืน (hits, scanned_count, source_note, unknowns, unknowns_title,
+    rate_limited)"""
     filings = scanner.run_filings_scan()
     if filings is not None:
-        hits, n, no_data, dropped = filings
+        hits, n, no_data, dropped, rate_limited = filings
         return (hits, n, scanner.filings_source_note(dropped),
-                no_data, scanner.FILINGS_UNKNOWNS_TITLE)
+                no_data, scanner.FILINGS_UNKNOWNS_TITLE, rate_limited)
     full = scanner.run_full_scan()
     if full is not None:
-        hits, n, last_date, unknowns = full
+        hits, n, last_date, unknowns, rate_limited = full
         note = ("โหมดทั้งตลาด (สำรอง — ข้อมูลข่าวแจ้งงบไม่สด) • "
                 f"ข้อมูล Trading_Dashboard ถึง {last_date:%d/%m/%Y}")
-        return hits, n, note, unknowns, None
-    hits, n = scanner.run_scan()
+        return hits, n, note, unknowns, None, rate_limited
+    hits, n, rate_limited = scanner.run_scan()
     note = ("โหมดรายชื่อหลัก (ข้อมูลข่าวแจ้งงบและ Trading_Dashboard ไม่สด — "
             "เช็คข่าวด้วย python set_news.py หรือรัน bt_fetch.py ที่โปรเจคนั้น)")
-    return hits, n, note, None, None
+    return hits, n, note, None, None, rate_limited
 
 
-async def daily_scan_job(context: ContextTypes.DEFAULT_TYPE):
+# กันซ้ำแบบเดียวกับรายงานเช้า: job 17:30 กับ startup fallback ใช้
+# digest_state ร่วมกัน (key "scan_last_run") + ธง in-flight (สแกนกินเวลา
+# หลายนาที — เปิดเครื่อง 17:29 อาจชนกับ job 17:30 พอดี)
+_scan_in_flight = False
+
+
+async def _run_daily_scan(context: ContextTypes.DEFAULT_TYPE, label: str):
+    """ตัวสแกนอัตโนมัติกลาง: ครั้งเดียวต่อวันทำการ + อัปเดตไม้เงาต่อท้าย
+
+    เดิมสแกน 17:30 เป็น job ใหญ่ตัวเดียวที่ไม่มี startup fallback —
+    ปิดเครื่องก่อนเวลาวันไหน วันนั้นไม่มีแถวใน scan_log และไม้เงาของวันนั้น
+    หายถาวร (จุดเข้าไม้เงา = เปิดวันถัดจากวันสแกน ย้อนสร้างไม่ได้)"""
+    global _scan_in_flight
     now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
     if now.weekday() >= 5 or _is_market_holiday(now.date()):
+        return
+    if _scan_in_flight:
+        return
+    if _load_digest_state().get("scan_last_run") == now.date().isoformat():
         return
     chat_ids = _load_chat_ids()
     if not chat_ids:
         return
+    _scan_in_flight = True
     try:
-        hits, n, note, unknowns, unk_title = await asyncio.to_thread(run_best_scan)
-    except Exception:
-        log.exception("daily scan failed")
-        return
-    report = scanner.format_report(
-        hits, n, source_note=note, unknowns=unknowns,
-        unknowns_title=unk_title, unknowns_hint="" if unk_title else None)
-    buttons = _watch_buttons(hits)
-    for cid in chat_ids:
         try:
-            await _send_long(context.bot, cid, report,
-                             reply_markup=buttons, parse_mode="HTML")
+            hits, n, note, unknowns, unk_title, rate_limited = \
+                await asyncio.to_thread(run_best_scan)
         except Exception:
-            log.exception("send scan report failed (chat %s)", cid)
-    # อัปเดต cache ไม้เงาต่อท้ายสแกน — ให้ส่วนไม้เงาใน "สถิติ" สดวันต่อวัน
-    # โดยผู้ใช้ไม่ต้องพิมพ์ "เงา" เอง (ราคาที่ต้องใช้ส่วนใหญ่เพิ่งถูกดึงไปแล้ว)
-    try:
-        await asyncio.to_thread(shadow.update_shadow)
-    except Exception:
-        log.exception("shadow update after scan failed")
+            log.exception("%s failed", label)
+            return
+        report = scanner.format_report(
+            hits, n, source_note=note, unknowns=unknowns,
+            unknowns_title=unk_title, unknowns_hint="" if unk_title else None,
+            rate_limited=rate_limited)
+        buttons = _watch_buttons(hits)
+        sent_any = False
+        for cid in chat_ids:
+            try:
+                await _send_long(context.bot, cid, report,
+                                 reply_markup=buttons, parse_mode="HTML")
+                sent_any = True
+            except Exception:
+                log.exception("send scan report failed (chat %s)", cid)
+        if sent_any:
+            state = _load_digest_state()
+            state["scan_last_run"] = now.date().isoformat()
+            _save_digest_state(state)
+        # อัปเดต cache ไม้เงาต่อท้ายสแกน — ให้ส่วนไม้เงาใน "สถิติ" สดวันต่อวัน
+        # โดยผู้ใช้ไม่ต้องพิมพ์ "เงา" เอง (ราคาที่ต้องใช้ส่วนใหญ่เพิ่งถูกดึงไปแล้ว)
+        try:
+            await asyncio.to_thread(shadow.update_shadow)
+        except Exception:
+            log.exception("shadow update after scan failed")
+    finally:
+        _scan_in_flight = False
+
+
+async def daily_scan_job(context: ContextTypes.DEFAULT_TYPE):
+    """job รายวัน 17:30: สแกนอัตโนมัติหลังปิดตลาด"""
+    await _run_daily_scan(context, "daily scan")
+
+
+async def startup_scan_job(context: ContextTypes.DEFAULT_TYPE):
+    """ตอนเปิดบอท: เปิดเครื่องค่ำเลย 17:30 และวันนี้ยังไม่ได้สแกน → สแกนชดเชย
+    (ก่อนเวลานั้นไม่ทำ — วอลุ่มวันยังไม่ครบ สแกนไปตัวเลขต่ำกว่าจริง)"""
+    now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
+    if now.time() < datetime.time(SCAN_HOUR, SCAN_MINUTE):
+        return
+    await _run_daily_scan(context, "startup scan")
 
 
 def _parse_thai_date(s: str):
@@ -1480,7 +1573,7 @@ def build_watchlist_summary(chat_id) -> str:
             lines.append(f"    🗑 {reason}")
     if errors:
         lines.append("")
-        lines.append("⚠️ ดึงไม่ได้: " + ", ".join(errors))
+        lines.append("⚠️ ดึงไม่ได้: " + ", ".join(html.escape(e) for e in errors))
     lines.append("")
     if stale:
         lines.append("🗑 ตัวที่หมดสภาพ กดปุ่มด้านล่างเอาออกได้เลย "
@@ -1520,8 +1613,7 @@ def set_port_size(chat_id, value: float):
     data = _load_port_settings()
     data[str(chat_id)] = value
     try:
-        with open(_PORT_SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=1)
+        stock_core.save_json_atomic(_PORT_SETTINGS_PATH, data)
     except Exception:
         log.exception("save port settings failed")
 
@@ -1881,12 +1973,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "🔍 กำลังสแกน... ใช้เวลาประมาณ 1-3 นาที รอสักครู่ครับ"
         )
-        hits, n, note, unknowns, unk_title = await asyncio.to_thread(run_best_scan)
+        hits, n, note, unknowns, unk_title, rate_limited = \
+            await asyncio.to_thread(run_best_scan)
         await _reply_long(
             update.message,
             scanner.format_report(
                 hits, n, source_note=note, unknowns=unknowns,
-                unknowns_title=unk_title, unknowns_hint="" if unk_title else None),
+                unknowns_title=unk_title, unknowns_hint="" if unk_title else None,
+                rate_limited=rate_limited),
             reply_markup=_watch_buttons(hits),
             parse_mode="HTML",
         )
@@ -2109,15 +2203,39 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(tickers) < 2:
             await update.message.reply_text("พิมพ์ <code>ติดตาม AOT</code>", parse_mode="HTML")
             return
-        added = []
+        added, rejected, unchecked = [], [], []
         for t in tickers[1:]:
-            base, _ = stock_core.add_to_watchlist(t, update.effective_chat.id)
-            added.append(base)
-        await update.message.reply_text(
-            f"✅ เพิ่มเข้าลิสต์แล้ว: <b>{html.escape(' '.join(added))}</b>\n"
-            "ดูทั้งหมด: <code>ลิสต์</code>",
-            parse_mode="HTML",
-        )
+            base = t.upper().strip().replace(".BK", "")
+            # กันชื่อที่ไม่ใช่ ticker (คำไทย/อักขระแปลก) — ของเสียตัวเดียว
+            # ทำข้อความแจ้งเตือนรวม (HTML) ของทั้งลิสต์ส่งไม่ออก
+            if not re.fullmatch(r"[A-Z0-9.&-]{1,15}", base):
+                rejected.append(t)
+                continue
+            # เช็คว่าดึงข้อมูลได้จริงก่อนรับ — กันพิมพ์ผิด (เช่น TSTJ แทน
+            # TSTH) ค้างในลิสต์ให้บอทไล่ดึงทุก 15 นาทีโดยไม่มีวันสำเร็จ
+            try:
+                d = await asyncio.to_thread(stock_core.get_stock_data, base)
+            except Exception:
+                d = False  # Yahoo ล่ม/rate limit — อย่าขวางการเก็บเข้าลิสต์
+            if d is None:
+                rejected.append(base)
+                continue
+            b, _ = stock_core.add_to_watchlist(base, update.effective_chat.id)
+            added.append(b)
+            if d is False:
+                unchecked.append(b)
+        lines = []
+        if added:
+            lines.append(f"✅ เพิ่มเข้าลิสต์แล้ว: <b>{html.escape(' '.join(added))}</b>")
+        if unchecked:
+            lines.append(f"(เช็คข้อมูล {html.escape(' '.join(unchecked))} "
+                         "ไม่ได้ชั่วคราว — รับไว้ก่อน ลองเปิดดูภายหลังอีกครั้ง)")
+        if rejected:
+            lines.append("❌ ไม่พบข้อมูล: " + html.escape(" ".join(rejected))
+                         + " — เช็คชื่ออีกครั้ง (ยังไม่เพิ่มเข้าลิสต์)")
+        if added:
+            lines.append("ดูทั้งหมด: <code>ลิสต์</code>")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
         return
 
     if tickers and tickers[0].lower() in ("เลิกติดตาม", "ถอน", "unwatch"):
@@ -2184,7 +2302,8 @@ def main():
         return
 
     print("  Bot กำลังทำงาน... (Ctrl+C เพื่อหยุด)")
-    print(f"  สแกนอัตโนมัติทุกวันทำการ เวลา {SCAN_HOUR:02d}:{SCAN_MINUTE:02d} น.")
+    print(f"  สแกนอัตโนมัติทุกวันทำการ เวลา {SCAN_HOUR:02d}:{SCAN_MINUTE:02d} น. "
+          "(เปิดบอทช้ากว่านั้น สแกนชดเชยให้เอง)")
     print(f"  เตือนวันงบทุกวันทำการ เวลา {REMIND_HOUR:02d}:{REMIND_MINUTE:02d} น.")
     print(f"  เช็คลิสต์ติดตามทุก {MONITOR_INTERVAL_MIN} นาที ช่วงตลาดเปิด")
     print(f"  เฝ้าข่าวแจ้งงบ (เว็บ SET) ทุก {NEWS_POLL_MINUTES} นาที "
@@ -2203,6 +2322,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(on_error)
     app.job_queue.run_daily(
         daily_scan_job,
         time=datetime.time(SCAN_HOUR, SCAN_MINUTE, tzinfo=ZoneInfo("Asia/Bangkok")),
@@ -2249,6 +2369,9 @@ def main():
     # จดเวลาว่ายังทำงานทุก 5 นาที + เก็บตกข่าวช่วงที่ปิดไป (ครั้งเดียวตอนเปิด)
     app.job_queue.run_repeating(alive_job, interval=300, first=10)
     app.job_queue.run_once(startup_catchup_job, when=20)
+    # heartbeat ✅ ตอนเปิดบอท (เครื่องบูต ~09:30 เลย job 08:30 เสมอ —
+    # กันซ้ำรายวันด้วย key alive_last_sent ใน digest_state)
+    app.job_queue.run_once(startup_heartbeat_job, when=25)
     # startup digest หน่วง 300 วิ ให้ catch-up (วินาที 20) + news poll รอบแรก
     # (วินาที 120) ทำงานจบก่อน ข้อมูลเช้านี้จะได้อยู่ใน CSV แล้ว
     app.job_queue.run_once(startup_digest_job, when=300)
@@ -2261,6 +2384,9 @@ def main():
     app.job_queue.run_once(startup_openpos_job, when=390)
     # ปฏิทินงบชดเชย — อ่านจากคลังในเครื่อง ไม่ยิงเครือข่าย วางท้ายสุดพอ
     app.job_queue.run_once(startup_calendar_job, when=420)
+    # สแกนชดเชยตอนเปิดคอมค่ำเลย 17:30 (หนักสุด — ยิง Yahoo หลายสิบตัว
+    # จึงวางท้ายสุด เงื่อนไขเวลา+กันซ้ำรายวันอยู่ใน job)
+    app.job_queue.run_once(startup_scan_job, when=450)
     # ย้าย watchlist.json format เดิม (list) → per-user dict ให้เจ้าของ (ครั้งเดียว)
     stock_core.migrate_legacy_watchlist(_load_chat_ids())
     app.run_polling(drop_pending_updates=True)

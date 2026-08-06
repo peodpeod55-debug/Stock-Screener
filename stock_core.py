@@ -68,16 +68,43 @@ def _pct(base, value):
     return (value - base) / base * 100
 
 
+# ── ไฟล์สถานะ JSON: เขียน/อ่านให้ทนไฟดับ ────────────────────────
+# ไฟล์สถานะทุกไฟล์ของระบบ (watchlist, คลังวันงบ, chat_ids, ...) ใช้คู่นี้:
+# เขียนแบบ atomic กันไฟล์ครึ่งๆ กลางๆ / อ่านเจอไฟล์เสียให้เก็บหลักฐานไว้
+# (โมดูลอื่น import ไปใช้ด้วย — อย่าย้ายออกจาก stock_core)
+
+def save_json_atomic(path: str, obj) -> None:
+    """เขียน JSON ลง .tmp ก่อนแล้วค่อยสลับแทนที่ (os.replace เป็น atomic
+    บน Windows) — ไฟดับ/crash กลางการเขียนจะไม่ทิ้งไฟล์เสีย ของเดิมยังอยู่"""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def load_json_or_backup(path: str, default):
+    """อ่าน JSON — ไฟล์ไม่มี (ครั้งแรก) คืน default เงียบๆ ตามปกติ
+    แต่ไฟล์มีแล้ว parse ไม่ได้ = ข้อมูลเสีย: เปลี่ยนชื่อเก็บเป็น .bak
+    ให้กู้มือได้ แทนที่จะทับทิ้งเงียบๆ รอบเขียนถัดไป แล้วคืน default"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except Exception:
+        try:
+            os.replace(path, path + ".bak")
+        except OSError:
+            pass
+        return default
+
+
 # ── caches (ลดจำนวน request กัน rate limit) ─────────────────────
 
 # ชื่อบริษัท/สกุลเงินแทบไม่เปลี่ยน → เก็บถาวรในไฟล์ เรียก stock.info
 # แค่ครั้งแรกที่เจอ ticker นั้นเท่านั้น
 _NAME_CACHE_PATH = os.path.join(_CACHE_DIR, "ticker_names.json")
-try:
-    with open(_NAME_CACHE_PATH, encoding="utf-8") as f:
-        _NAME_CACHE = json.load(f)
-except Exception:
-    _NAME_CACHE = {}
+_NAME_CACHE = load_json_or_backup(_NAME_CACHE_PATH, {})
 
 
 def _get_name_currency(stock, used_ticker):
@@ -93,8 +120,7 @@ def _get_name_currency(stock, used_ticker):
     if info.get("longName") or info.get("shortName"):
         _NAME_CACHE[used_ticker] = {"name": name, "currency": currency}
         try:
-            with open(_NAME_CACHE_PATH, "w", encoding="utf-8") as f:
-                json.dump(_NAME_CACHE, f, ensure_ascii=False)
+            save_json_atomic(_NAME_CACHE_PATH, _NAME_CACHE)
         except Exception:
             pass
     return name, currency
@@ -114,20 +140,16 @@ def _result_ttl_seconds():
 
 # ── วันประกาศงบ (จำอัตโนมัติจาก Yahoo + บันทึกเองได้) ──────────
 
+# คลังวันงบคือสินทรัพย์หลักของสแกนโหมดข่าวแจ้งงบ — ไฟล์เสียห้ามทับทิ้งเงียบๆ
 _EARN_STORE_PATH = os.path.join(_CACHE_DIR, "earnings_dates.json")
-try:
-    with open(_EARN_STORE_PATH, encoding="utf-8") as f:
-        _EARN_STORE = json.load(f)
-except Exception:
-    _EARN_STORE = {}
+_EARN_STORE = load_json_or_backup(_EARN_STORE_PATH, {})
 
 _EARN_REFRESH_SECONDS = 24 * 3600  # ดึงจาก Yahoo วันละครั้งพอ
 
 
 def _save_earn_store():
     try:
-        with open(_EARN_STORE_PATH, "w", encoding="utf-8") as f:
-            json.dump(_EARN_STORE, f, ensure_ascii=False, indent=1)
+        save_json_atomic(_EARN_STORE_PATH, _EARN_STORE)
     except Exception:
         pass
 
@@ -413,17 +435,12 @@ _WATCHLIST_PATH = os.path.join(
 def _load_watchlists() -> dict:
     """คืน dict {chat_id_str: [symbols]} เสมอ
     ถ้าไฟล์ยังเป็น format เดิม (list) คืน {} — รอ migrate_legacy_watchlist()"""
-    try:
-        with open(_WATCHLIST_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return {}
+    data = load_json_or_backup(_WATCHLIST_PATH, {})
     return data if isinstance(data, dict) else {}
 
 
 def _save_watchlists(data: dict):
-    with open(_WATCHLIST_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=1)
+    save_json_atomic(_WATCHLIST_PATH, data)
 
 
 def get_watchlist(chat_id):

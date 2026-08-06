@@ -22,6 +22,11 @@ digest_state.json
 port_settings.json
 trades_log.csv
 shadow_log.csv
+f45_backlog.json
+
+# ไฟล์ชั่วคราว/สำรองจากการเขียนไฟล์สถานะแบบ atomic
+*.tmp
+*.bak
 
 # ตั้งค่าเฉพาะเครื่อง
 .claude/

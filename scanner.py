@@ -11,6 +11,8 @@ import time
 import datetime
 from zoneinfo import ZoneInfo
 
+from yfinance.exceptions import YFRateLimitError
+
 import stock_core
 from stock_core import format_signed_pct, volume_flag, signal_score
 
@@ -186,6 +188,38 @@ def _parquet_prefilter(candidates):
     return kept, dropped
 
 
+RATE_LIMIT_PAUSE_S = 90  # โดน Yahoo จำกัดคำขอกลางสแกน: พักกี่วินาทีก่อนลองต่อ
+
+
+def _fetch_all(symbols):
+    """ดึงข้อมูลทีละตัว คืน ({sym: data หรือ None}, รายชื่อที่ยังไม่ได้ตรวจ)
+
+    เดิมโดน rate limit กลางคันแล้วตัวที่เหลือถูกตีเป็น "ไม่มีข้อมูลราคา"
+    ทั้งหมดแบบเงียบๆ (หลุดจาก scan_log และไม้เงาของวันนั้นถาวร)
+    → แก้เป็น: พักครั้งเดียว (RATE_LIMIT_PAUSE_S) แล้วไล่ต่อจากตัวเดิม
+    โดนซ้ำอีกถือว่าโควตาหมดจริง คืนตัวที่เหลือให้ผู้เรียกรายงานแยก"""
+    out, rate_limited = {}, []
+    paused = False
+    i = 0
+    while i < len(symbols):
+        sym = symbols[i]
+        try:
+            d = stock_core.get_stock_data(sym)
+        except YFRateLimitError:
+            if not paused:
+                paused = True
+                time.sleep(RATE_LIMIT_PAUSE_S)
+                continue  # ลองตัวเดิมซ้ำหลังพัก
+            rate_limited = list(symbols[i:])
+            break
+        except Exception:
+            d = None
+        time.sleep(0.2)  # เว้นจังหวะกัน rate limit
+        out[sym] = d
+        i += 1
+    return out, rate_limited
+
+
 def run_filings_scan():
     """สแกนจากรายชื่อบริษัทที่แจ้งงบใน MAX_DAYS_SINCE วันล่าสุด
 
@@ -193,7 +227,7 @@ def run_filings_scan():
     (รวมที่ผู้ใช้บันทึกเองผ่าน "งบ XXX วันที่") แล้วยืนยันทุกตัวด้วยข้อมูลสด
     จาก Yahoo ตามเกณฑ์เดิมเป๊ะ — ผลบันทึกลง scan_log.csv schema เดิม
 
-    คืน (hits, candidate_count, no_data_syms, dropped_count)
+    คืน (hits, candidate_count, no_data_syms, dropped_count, rate_limited)
     หรือ None ถ้าข้อมูลข่าวไม่สด (poll ล้มนาน/ไม่เคยดึง) — ผู้เรียกถอยไป
     โหมด parquet/รายชื่อหลักแทน (fail open: เว็บ SET ล่มต้องยังสแกนได้)
     """
@@ -211,14 +245,10 @@ def run_filings_scan():
         candidates[sym] = info["datetime"].date()  # ข่าวจริงชนะวันจากคลัง
 
     kept, dropped = _parquet_prefilter(candidates)
+    data, rate_limited = _fetch_all(kept)
     hits = []
     no_data = []  # แจ้งงบแล้วแต่ Yahoo ไม่มีข้อมูลราคา (หุ้นเล็ก/กอง REIT บางตัว)
-    for sym in kept:
-        try:
-            d = stock_core.get_stock_data(sym)
-        except Exception:
-            d = None
-        time.sleep(0.2)  # เว้นจังหวะกัน rate limit
+    for sym, d in data.items():
         if d is None:
             no_data.append(sym)
             continue
@@ -239,14 +269,15 @@ def run_filings_scan():
         reverse=True,
     )
     _append_log(hits)
-    return hits, len(candidates), no_data, dropped
+    return hits, len(candidates), no_data, dropped, rate_limited
 
 
 def run_full_scan():
     """สแกนทั้งตลาดจากข้อมูล dashboard + ยืนยันด้วยข้อมูลสด
 
-    คืน (hits, scanned_count, last_date) หรือ None ถ้าข้อมูล dashboard
-    เก่าเกิน LOCAL_MAX_AGE_DAYS วัน (ให้ผู้เรียกถอยไปใช้ run_scan แทน)
+    คืน (hits, scanned_count, last_date, unknowns, rate_limited)
+    หรือ None ถ้าข้อมูล dashboard เก่าเกิน LOCAL_MAX_AGE_DAYS วัน
+    (ให้ผู้เรียกถอยไปใช้ run_scan แทน)
     """
     last_date = local_data_last_date()
     if last_date is None:
@@ -256,14 +287,10 @@ def run_full_scan():
         return None
 
     candidates = coarse_candidates()
+    data, rate_limited = _fetch_all(candidates)
     hits = []
     unknowns = []  # ราคา/วอลุ่มพุ่ง แต่ Yahoo ไม่มีข้อมูลวันงบ (หุ้นเล็กบางตัว)
-    for sym in candidates:
-        try:
-            d = stock_core.get_stock_data(sym)
-        except Exception:
-            d = None
-        time.sleep(0.2)
+    for sym, d in data.items():
         if d is None:
             continue
         days = d["days_since_earnings"]
@@ -290,19 +317,15 @@ def run_full_scan():
         reverse=True,
     )
     _append_log(hits)
-    return hits, len(_local_parquet_files()), last_date, unknowns
+    return hits, len(_local_parquet_files()), last_date, unknowns, rate_limited
 
 
 def run_scan():
-    """คืน (hits, scanned_count) — hits เรียงตามคะแนนสัญญาณ"""
+    """คืน (hits, scanned_count, rate_limited) — hits เรียงตามคะแนนสัญญาณ"""
     symbols = load_universe()
+    data, rate_limited = _fetch_all(symbols)
     hits = []
-    for sym in symbols:
-        try:
-            d = stock_core.get_stock_data(sym)
-        except Exception:
-            d = None
-        time.sleep(0.2)  # เว้นจังหวะกัน rate limit
+    for sym, d in data.items():
         if d is None:
             continue
         days = d["days_since_earnings"]
@@ -320,7 +343,7 @@ def run_scan():
         reverse=True,
     )
     _append_log(hits)
-    return hits, len(symbols)
+    return hits, len(symbols), rate_limited
 
 
 def _append_log(hits):
@@ -361,7 +384,8 @@ def _append_log(hits):
 
 
 def format_report(hits, scanned_count, html=True, limit=15, source_note=None,
-                  unknowns=None, unknowns_title=None, unknowns_hint=None):
+                  unknowns=None, unknowns_title=None, unknowns_hint=None,
+                  rate_limited=None):
     b = (lambda t: f"<b>{t}</b>") if html else (lambda t: t)
     today = datetime.date.today().strftime("%d/%m/%Y")
     lines = [
@@ -423,6 +447,16 @@ def format_report(hits, scanned_count, html=True, limit=15, source_note=None,
         if hint:
             lines.append(hint)
 
+    if rate_limited:
+        shown = ", ".join(rate_limited[:12])
+        if len(rate_limited) > 12:
+            shown += f" ...(+{len(rate_limited) - 12})"
+        lines += ["",
+                  f"⏳ โดน Yahoo จำกัดคำขอ — ยังไม่ได้ตรวจ {len(rate_limited)} ตัว:",
+                  shown,
+                  "รอสัก 10-15 นาทีแล้วพิมพ์ สแกน อีกครั้ง" if not html
+                  else "รอสัก 10-15 นาทีแล้วพิมพ์ <code>สแกน</code> อีกครั้ง"]
+
     if hits:
         lines.append("")
         lines.append("เก็บเข้าลิสต์: พิมพ์ ติดตาม <ชื่อหุ้น>" if not html
@@ -446,19 +480,20 @@ if __name__ == "__main__":
     print("\nกำลังสแกน... (ประมาณ 1-3 นาที)\n")
     res = run_filings_scan()
     if res is not None:
-        hits, n, no_data, dropped = res
+        hits, n, no_data, dropped, rate_limited = res
         print(format_report(hits, n, html=False,
                             source_note=filings_source_note(dropped),
                             unknowns=no_data,
                             unknowns_title=FILINGS_UNKNOWNS_TITLE,
-                            unknowns_hint=""))
+                            unknowns_hint="", rate_limited=rate_limited))
     else:
         full = run_full_scan()
         if full is not None:
-            hits, n, last_date, unknowns = full
+            hits, n, last_date, unknowns, rate_limited = full
             note = f"โหมดทั้งตลาด • ข้อมูล Trading_Dashboard ถึง {last_date:%d/%m/%Y}"
         else:
-            hits, n = run_scan()
+            hits, n, rate_limited = run_scan()
             note, unknowns = "โหมดรายชื่อหลัก (ข้อมูล Trading_Dashboard ไม่สด)", None
-        print(format_report(hits, n, html=False, source_note=note, unknowns=unknowns))
+        print(format_report(hits, n, html=False, source_note=note,
+                            unknowns=unknowns, rate_limited=rate_limited))
     print(f"\nบันทึกผลลง {os.path.basename(LOG_PATH)} แล้ว\n")
