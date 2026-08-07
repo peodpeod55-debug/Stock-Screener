@@ -282,18 +282,32 @@ _FILINGS_PATH = os.path.join(_BASE_DIR, "filings_log.csv")
 
 def _log_f45_result(entry):
     """ต่อท้าย earnings_results.csv — กันซ้ำด้วย (หุ้น, งวด, ปี)
-    เพราะคำสั่ง "ข่าวงบ" อ่าน F45 ฉบับเดิมซ้ำได้หลายรอบ"""
+    เพราะคำสั่ง "ข่าวงบ" อ่าน F45 ฉบับเดิมซ้ำได้หลายรอบ
+
+    บริษัทยื่นฉบับแก้ไขได้ (ตัวเลข/สรุปเปลี่ยนจากที่บันทึกไว้) — เคสนั้น
+    ต่อท้ายเป็นแถวใหม่แทนการ skip: ไฟล์ยัง append-only (เก็บประวัติว่า
+    เคยประกาศผิด) และฝั่งอ่าน (สรุปงบเช้า/ยืนยันรอบเช้า) เลือกแถว
+    news_datetime ล่าสุดต่อ symbol อยู่แล้ว จึงได้เลขแก้ไขเองอัตโนมัติ"""
     parsed = entry.get("f45_data")
     if not parsed:
         return
     key = (entry["symbol"], parsed.get("period") or "", str(parsed.get("year") or ""))
+    new_vals = (f"{parsed['profit_cur'] / 1e6:.2f}",
+                f"{parsed['profit_prior'] / 1e6:.2f}",
+                entry.get("f45") or "")
+    last_match = None  # ยื่นแก้ไขได้หลายครั้ง — ต้องเทียบกับฉบับล่าสุดของงวดนี้
     try:
         with open(_RESULTS_PATH, encoding="utf-8-sig") as f:
             for r in csv.DictReader(f):
                 if (r["symbol"], r["period"], r["year"]) == key:
-                    return
+                    last_match = r
     except FileNotFoundError:
         pass
+    if last_match is not None and new_vals == (
+            last_match.get("profit_mb") or "",
+            last_match.get("profit_prior_mb") or "",
+            last_match.get("summary") or ""):
+        return  # ฉบับเดิมถูกอ่านซ้ำ — ไม่ใช่ฉบับแก้ไข
     is_new = not os.path.exists(_RESULTS_PATH)
     try:
         with open(_RESULTS_PATH, "a", newline="", encoding="utf-8-sig") as f:
@@ -307,10 +321,10 @@ def _log_f45_result(entry):
                 entry["symbol"],
                 parsed.get("period") or "",
                 parsed.get("year") or "",
-                f"{parsed['profit_cur'] / 1e6:.2f}",
-                f"{parsed['profit_prior'] / 1e6:.2f}",
+                new_vals[0],
+                new_vals[1],
                 f"{g:.1f}" if g is not None else "",
-                entry.get("f45") or "",
+                new_vals[2],
             ])
     except Exception:
         pass  # ไฟล์เปิดค้างใน Excel ฯลฯ — อย่าให้ล้มการแจ้งเตือน
@@ -367,12 +381,14 @@ def _save_f45_backlog(backlog):
         pass
 
 
-def _backlog_put(backlog, sym, url, dt, failed=False):
+def _backlog_put(backlog, sym, url, dt, failed=False, corrected=False):
     """เพิ่ม/อัปเดตหุ้นในคิว — ฉบับใหม่สุดชนะ (บริษัทยื่นแก้ไขได้)
-    failed=True คือเพิ่งโหลดหน้าไม่สำเร็จ → นับครั้งไว้ตัดตอนครบโควตา"""
+    failed=True คือเพิ่งโหลดหน้าไม่สำเร็จ → นับครั้งไว้ตัดตอนครบโควตา
+    corrected ติดไปกับฉบับในคิว — ป้าย 📝 ต้องไม่หายแม้อ่านข้ามรอบ"""
     item = backlog.setdefault(sym, {"tries": 0})
     item["url"] = url
     item["datetime"] = dt.isoformat()
+    item["corrected"] = corrected
     if failed:
         item["tries"] = item.get("tries", 0) + 1
 
@@ -399,7 +415,8 @@ def _attach_f45_summaries(by_symbol):
     )
     take = ordered[:F45_DETAIL_MAX]
     for sym in ordered[F45_DETAIL_MAX:]:  # เกินโควตารอบนี้ → เข้าคิว
-        _backlog_put(backlog, sym, targets[sym], by_symbol[sym]["datetime"])
+        _backlog_put(backlog, sym, targets[sym], by_symbol[sym]["datetime"],
+                     corrected=by_symbol[sym].get("f45_corrected", False))
     # โควตาที่เหลือหยิบจากคิวเก่ามาอ่าน — ข้ามตัวที่อ่านรอบนี้อยู่แล้ว
     spare = [s for s in backlog
              if s not in targets][: max(0, F45_DETAIL_MAX - len(take))]
@@ -418,12 +435,16 @@ def _attach_f45_summaries(by_symbol):
         if not text:
             # โหลดหน้าไม่สำเร็จ → เข้าคิวลองใหม่รอบหน้า
             _backlog_put(backlog, sym, targets[sym], by_symbol[sym]["datetime"],
-                         failed=True)
+                         failed=True,
+                         corrected=by_symbol[sym].get("f45_corrected", False))
             continue
         backlog.pop(sym, None)  # ได้เนื้อหาแล้ว — พ้นคิว (parse ไม่ได้ก็ไม่ลองซ้ำ)
         parsed = parse_f45(text)
         if parsed:
-            by_symbol[sym]["f45"] = format_f45_summary(parsed)
+            summary = format_f45_summary(parsed)
+            if by_symbol[sym].get("f45_corrected"):
+                summary += " (📝 ฉบับแก้ไข)"
+            by_symbol[sym]["f45"] = summary
             by_symbol[sym]["f45_data"] = parsed
             _log_f45_result(by_symbol[sym])
     for sym in spare:
@@ -439,8 +460,11 @@ def _attach_f45_summaries(by_symbol):
                 dt = datetime.datetime.fromisoformat(item["datetime"])
             except (KeyError, ValueError):
                 dt = datetime.datetime.now(_BKK)
+            summary = format_f45_summary(parsed)
+            if item.get("corrected"):
+                summary += " (📝 ฉบับแก้ไข)"
             _log_f45_result({"symbol": sym, "datetime": dt,
-                             "f45": format_f45_summary(parsed),
+                             "f45": summary,
                              "f45_data": parsed})
     _save_f45_backlog(backlog)
 
@@ -534,6 +558,9 @@ def check_new_earnings_news(max_age_hours: float = 14, days_back: int = 1):
         # ลูปไล่จากข่าวใหม่ → เก่า จึงเก็บเฉพาะฉบับแรกที่เจอ (= ใหม่สุด)
         if kind == "F45" and "f45_url" not in entry:
             entry["f45_url"] = it["url"]
+            # ป้ายฉบับแก้ไข — หัวข่าว SET ต่อท้ายด้วย "(แก้ไข)" เสมอ
+            # ต้องตั้งคู่กับ f45_url เพื่อให้ป้ายตรงกับฉบับที่ถูกอ่านจริง
+            entry["f45_corrected"] = "(แก้ไข" in it["headline"]
         if it["datetime"] > entry["datetime"]:
             entry["datetime"] = it["datetime"]
     _save_seen(seen)
@@ -560,6 +587,7 @@ def list_earnings_news(days_back: int = 1):
             entry["kinds"].append(kind)
         if kind == "F45" and "f45_url" not in entry:
             entry["f45_url"] = it["url"]
+            entry["f45_corrected"] = "(แก้ไข" in it["headline"]
         if it["datetime"] > entry["datetime"]:
             entry["datetime"] = it["datetime"]
     _attach_f45_summaries(by_symbol)
