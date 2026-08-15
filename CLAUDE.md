@@ -25,20 +25,31 @@ python backtest.py            # backtest ระบบคะแนนกับข
 
 - `เริ่ม Bot.bat` — รันบอทพร้อม auto-restart ใน 15 วินาทีถ้า crash (Ctrl+C = ปิดปกติ ไม่วนกลับ)
 - `ติดตั้งเปิดเองตอนบูต.bat` — ลงทะเบียนให้บอทเปิดเองตอนบูตเครื่อง
-- ไม่มี test suite / linter — ตรวจด้วยการรันสคริปต์นั้นตรงๆ (ทุกโมดูลรันเดี่ยวได้)
+- `python -m pytest` — เทสต์ใน `tests/` (ไม่แตะเน็ต) ครอบคลุมเฉพาะส่วน "วิเคราะห์"/PHASE 0 (`ta_prompt`, `dashboard_feed`, `next_earnings_date`, ปุ่ม/handler ใหม่) — โมดูลเก่ายังไม่มีเทสต์ ตรวจด้วยการรันสคริปต์นั้นตรงๆ (ทุกโมดูลรันเดี่ยวได้) · `tests/test_ta_prompt_matches_dashboard.py` รัน `taPrompt()` ตัวจริงจาก `market_dashboard.js` ใน Node มาเทียบ (skip ถ้าไม่มี node/ไฟล์ dashboard)
 
 ## สถาปัตยกรรม
 
 ```
 telegram_bot.py   ← entry point: handler + scheduled jobs ทั้งหมด
-  ├── stock_core.py   ← โมดูลกลาง: ดึงข้อมูล Yahoo, คำนวณสัญญาณ, คะแนน, watchlist
+  ├── stock_core.py   ← โมดูลกลาง: ดึงข้อมูล Yahoo, คำนวณสัญญาณ, คะแนน, watchlist, คลังวันงบ
   ├── scanner.py      ← สแกนหุ้นตอบรับงบ (เกณฑ์: ตอบรับ ≥2%, วอลุ่ม ≥1.5 เท่า)
   ├── set_news.py     ← ดึงข่าวแจ้งงบจากเว็บ SET ผ่าน Playwright
   ├── stats.py        ← สถิติจาก scan_log.csv (+สรุปไม้เงาจาก cache)
-  └── shadow.py       ← ไม้เงา: replay ทุกแถวใน scan_log เป็นเทรดจำลอง
+  ├── shadow.py       ← ไม้เงา: replay ทุกแถวใน scan_log เป็นเทรดจำลอง
+  ├── ta_prompt.py    ← ข้อความ PHASE 0 สำหรับ Gem เทคนิค (port ตัวต่อตัวจาก taPrompt() ของ dashboard)
+  └── dashboard_feed.py ← อ่าน payload ของ Trading_Dashboard (site/data ในเครื่อง → HTTPS) คืนหุ้นทีละตัว
 stock_lookup.py       ← CLI ดูหุ้นรายตัว (ใช้ stock_core เหมือนบอท)
 backtest.py           ← จำลองระบบคะแนนกับวันงบเก่าจาก Yahoo
+tests/                ← pytest (ดู "คำสั่งที่ใช้บ่อย")
 ```
+
+### ta_prompt.py + dashboard_feed.py — คำสั่ง "วิเคราะห์" (ปุ่ม 📐)
+
+- โปรเจกต์ `Trading_Dashboard` (โฟลเดอร์ข้างเคียง / deploy ที่ `DASHBOARD_URL`) เป็น**แหล่งอ่านอย่างเดียว** — ห้ามแก้ไฟล์ของมันจากที่นี่ · โครง payload: `site/data/manifest.json` (`schema_version` 1, `build_id` hex) → `data/<build_id>/core.json` (`asof`, `markets.TH.{asof,indexName,intraday,bench.close}`) + `stocks-TH.json` (`{"stocks":[…]}` ~882 ตัว)
+- `dashboard_feed.load_stock(sym, "TH", site_dir=…, url=…, max_age_days=…)` → `(stock | None, market_meta)` — ลำดับ: `DASHBOARD_SITE_DIR` ในเครื่อง → ถ้าไม่มี/เก่ากว่า `scanner.LOCAL_MAX_AGE_DAYS` (5 วัน) → HTTPS `DASHBOARD_URL` (ต้องส่ง User-Agent แบบเบราว์เซอร์ — Cloudflare error 1010 บล็อก `Python-urllib`) → HTTPS ล้มแต่ในเครื่องมีของเก่า → ใช้ของเก่าพร้อม `meta["stale"]=True` → ไม่มีอะไรเลย → โยน `DashboardUnavailable` (exception ชนิดเดียวที่ handler จับ) · `schema_version` ≠ 1 หรือ `build_id` ไม่ใช่ `^[a-f0-9]{8,64}$` → ปฏิเสธทันที ไม่ลองทางอื่น (กัน path traversal) · cache core+stocks ตาม `(source, build_id)` เก็บ build เดียว, manifest อ่านใหม่ทุกครั้ง · stdlib ล้วน ไม่อ่าน env เอง (telegram_bot ส่งค่ามาให้)
+- `ta_prompt.build_ta_prompt(stock, meta, next_earn)` = `taPrompt()` ของ `market_dashboard.js` **ทุกบรรทัด ยกเว้น ข.8** (วันงบ — payload TH ไม่มี `ed` จึงใช้ `stock_core.next_earnings_date()` อ่านคลังวันงบในเครื่อง manual ชนะ auto ไม่ยิง Yahoo) — จุดที่ JS กับ Python ต่างจนพลาดได้: `f()` ต้องเท่ากับ `toLocaleString('en-US',{maximumFractionDigits:d})` (Decimal + ROUND_HALF_UP, คอมมา, ตัดศูนย์ท้าย) · `vmax3` เช็ค `is not None` ไม่ใช่ truthiness · `rs`/`bis` = 0 ต้องโชว์ 0 · ทุกค่า None → "ไม่มีข้อมูล" ห้ามใส่ 0/เว้นว่าง · **แก้เทมเพลตฝั่ง dashboard เมื่อไหร่ต้องแก้ที่นี่ให้ตรง** (drift test จะแดง)
+- ฝั่งบอท: `_ta_reply(message, sym)` ใช้ร่วมระหว่างคำสั่ง `วิเคราะห์`/`ta` และ callback `ta:SYM` — ส่ง `<pre>` (html.escape แล้ว) ให้กดคัดลอกทั้งก้อน + ปุ่ม URL `GEM_TA_URL` · **ส่งด้วย `reply_text` ตรง ไม่ผ่าน `_reply_long`** (ตัดตามบรรทัดจะผ่ากลาง `<pre>`) — ยาว ≈1,400 ตัวอักษร มีเทสต์ขอบบน · ไม่มีหุ้นใน payload → บอกตรงๆ ไม่ fallback ไปคำนวณเอง · ข้อมูลเก่า → ส่งให้พร้อม ⚠️ ไม่ปฏิเสธ · บอทไม่วิเคราะห์เอง ไม่เรียก Gemini API — ผู้ใช้เอาบล็อกไปวางใน Gem พร้อมรูป Weekly+Daily
+- env: `DASHBOARD_SITE_DIR` (โฟลเดอร์ `site` ของ Trading_Dashboard; ว่าง = ใช้เว็บ), `DASHBOARD_URL` (default `https://sakura.peodbot.com`), `GEM_TA_URL` (Gem ผูกบัญชี Google รายคน — **ห้าม hardcode ลงโค้ด/เอกสาร** อยู่ใน `.env` เท่านั้น; ว่าง = หน้ารายการ Gems) — อ่านผ่าน `scanner._env_value` · คำสั่ง `คำอธิบายงบ`/`mda XXX` แค่ประกอบลิงก์ `https://earningsradar.pages.dev/company/XXX/` ไม่ยิงเว็บ
 
 ### stock_core.py — หัวใจของระบบ
 
@@ -66,13 +77,14 @@ backtest.py           ← จำลองระบบคะแนนกับว
 | ตอนเปิดบอท (หน่วง 300 วิ) | startup digest: ส่งสรุปงบเช้าถ้าวันนี้ยังไม่ได้ส่ง (รองรับผู้ใช้เปิดคอมสาย ~09:30 เกินเวลา job 08:55) — ยืนยันรอบเช้าก็มี fallback แบบเดียวกัน (หน่วง 330 วิ, เฉพาะช่วง 10:30-12:00) |
 
 - ถ้าดึงข่าว SET ล้มเหลวติดต่อกัน ≥3 รอบ (~30 นาที) บอทเด้ง ⚠️ เตือนผู้ใช้เองครั้งเดียวต่อการล่มหนึ่งช่วง และแจ้ง ✅ เมื่อกลับมาปกติ (ตัวนับใน memory ของ `news_monitor_job`)
-- คำสั่งผู้ใช้เป็น**ข้อความภาษาไทยธรรมดา** (สแกน / ติดตาม XXX / ลิสต์ / สถิติ / เงา / งบ XXX วันที่ / ปฏิทิน / ข่าวงบ / สรุปงบ N / ยืนยัน / พอร์ต N / ไม้ XXX / ซื้อ-ขาย XXX ราคา / เทรด) ผ่าน `handle_text()` — ไม่ใช่ slash command และทุกคำสั่งมี alias อังกฤษ (scan/watch/unwatch/list/stats/shadow/earn/calendar/news/digest/confirm/port/size/buy/sell/trades) เช็คแบบ case-insensitive — เพิ่มคำสั่งใหม่ต้องมี alias อังกฤษด้วย
+- คำสั่งผู้ใช้เป็น**ข้อความภาษาไทยธรรมดา** (สแกน / ติดตาม XXX / ลิสต์ / สถิติ / เงา / งบ XXX วันที่ / ปฏิทิน / ข่าวงบ / สรุปงบ N / ยืนยัน / พอร์ต N / ไม้ XXX / ซื้อ-ขาย XXX ราคา / เทรด / วิเคราะห์ XXX / คำอธิบายงบ XXX) ผ่าน `handle_text()` — ไม่ใช่ slash command และทุกคำสั่งมี alias อังกฤษ (scan/watch/unwatch/list/stats/shadow/earn/calendar/news/digest/confirm/port/size/buy/sell/trades/ta/mda) เช็คแบบ case-insensitive — เพิ่มคำสั่งใหม่ต้องมี alias อังกฤษด้วย
 - position sizing (`ไม้ XXX`): เสี่ยง `RISK_PCT_PER_TRADE` (1%) ของพอร์ตต่อไม้ ÷ ระยะราคาเข้า→เส้น ⛔ (pre_earn_low) ปัดลง lot ละ 100 — ขนาดพอร์ตเก็บต่อ chat ใน `port_settings.json`
 - trade journal (`ซื้อ/ขาย/เทรด`): เก็บลง `trades_log.csv` แบบ append-only ผ่าน `stock_core.log_trade` — แถวซื้อเก็บบริบท ณ ตอนเข้า (วันงบ/เส้น ⛔/คะแนน) เพราะย้อนหลังไม่ได้ ส่วนกำไร/R คำนวณตอนอ่านจาก `pair_trades` (หนึ่งไม้เปิดต่อหุ้นต่อ chat) — `stats.build_stats_report(html, chat_id)` ต่อท้ายส่วน "ไม้เงา" (จาก cache) และ "ผลไม้จริง" เทียบตามช่วงคะแนน
 - ไม้เงา (`เงา` / shadow.py): ทุกแถวใน `scan_log.csv` = ไม้จำลอง (ครั้งแรกต่อ ticker+วันงบ) เข้า open วันถัดจากวันสแกน / ตัดปิดหลุด `pre_earn_low` / ครบ 20 วันทำการ — replay จากราคาย้อนหลังตามปรัชญา "คำนวณย้อนหลังได้เสมอ" ไม่มี job เฝ้า ไม้ปิดแล้ว cache ลง `shadow_log.csv` เรียกซ้ำยิง Yahoo เฉพาะไม้ที่ยังเปิด — BANDS ใช้ของ stats (lazy import ใน `_bands()` กัน import วนกับ stats ที่เรียก shadow)
 - ข้อความ Telegram เป็น HTML, จำกัด 3900 ตัวอักษร/ข้อความ — ส่งข้อความยาวต้องใช้ `_reply_long` / `_send_long`
 - แนวคิดสามคำสั่งหลัก: **สแกนหา → ติดตามเฝ้า → ลิสต์ดู** — เฉพาะ "ติดตาม" เท่านั้นที่ทำให้บอทเฝ้าและเด้งเตือน
-- สุขอนามัยลิสต์: `build_watchlist_summary` คืน `(text, stale)` — ตัวที่โดน ⛔ / งบเกิน 60 วัน / ไม่รู้วันงบ ติดป้าย 🗑 พร้อมปุ่มลบ (callback `unwatch:SYM`) ยกเว้นตัวที่งบรอบใหม่ ≤14 วัน (ติดตามรองบ)
+- สุขอนามัยลิสต์: `build_watchlist_summary` คืน `(text, stale)` — ตัวที่โดน ⛔ / งบเกิน 60 วัน / ไม่รู้วันงบ ติดป้าย 🗑 พร้อมปุ่มลบ (callback `unwatch:SYM`) ยกเว้นตัวที่งบรอบใหม่ ≤14 วัน (ติดตามรองบ) — คีย์บอร์ดใต้ลิสต์ = แถว 🗑 ของตัวหมดสภาพ ต่อด้วยแถว 📐 (callback `ta:SYM`) ของทุกตัวในลิสต์ 15 ตัวแรก (`_list_buttons`)
+- ปุ่มใต้ผลสแกน / สรุปงบ / ยืนยัน (`_watch_buttons`, เรียก 6 จุด): **หุ้นละแถว** `[➕ SYM watch:SYM] [📐 SYM ta:SYM] [📅 SYM url Earnings Radar]` — เพิ่มปุ่มต่อหุ้นให้แก้ที่ `_stock_row` จุดเดียว
 
 ### set_news.py — จุดเปราะบางที่สุดของระบบ
 
@@ -95,7 +107,7 @@ backtest.py           ← จำลองระบบคะแนนกับว
 
 ## ไฟล์ข้อมูล/สถานะ (gitignore ทั้งหมด — อย่า commit)
 
-`.env` (BOT_TOKEN), `watchlist.json`, `chat_ids.json`, `news_seen.json`, `last_alive.json`, `watch_state.json`, `scan_log.csv`, `lookup_log.csv`, `backtest_results.csv`, `bot_log.txt`, `.yf_cache/`, `filings_log.csv` (ใครแจ้งงบเมื่อไหร่ — ดิบกว่า earnings_results.csv รวมตัวที่อ่านตัวเลขไม่ได้ด้วย), `digest_state.json` (กันส่งรายงานอัตโนมัติซ้ำ — key รายวัน `last_sent` / `confirm_last_sent` / `remind_last_sent` / `openpos_last_sent` / `alive_last_sent` / `scan_last_run` + รายสัปดาห์ `calendar_last_sent` เก็บ anchor วันอาทิตย์ล่าสุด), `port_settings.json` (ขนาดพอร์ตต่อ chat สำหรับคำนวณขนาดไม้), `trades_log.csv` (บันทึกไม้จริง — append-only เหมือน scan_log), `shadow_log.csv` (ไม้เงาที่ปิดแล้ว — cache สร้างใหม่ได้เสมอจาก scan_log), `f45_backlog.json` (คิว F45 ที่ยังไม่ได้อ่านตัวเลข — วันพีคเกินโควตาต่อรอบ)
+`.env` (BOT_TOKEN, DASHBOARD_TH_CACHE, DASHBOARD_SITE_DIR, DASHBOARD_URL, GEM_TA_URL), `watchlist.json`, `chat_ids.json`, `news_seen.json`, `last_alive.json`, `watch_state.json`, `scan_log.csv`, `lookup_log.csv`, `backtest_results.csv`, `bot_log.txt`, `.yf_cache/`, `filings_log.csv` (ใครแจ้งงบเมื่อไหร่ — ดิบกว่า earnings_results.csv รวมตัวที่อ่านตัวเลขไม่ได้ด้วย), `digest_state.json` (กันส่งรายงานอัตโนมัติซ้ำ — key รายวัน `last_sent` / `confirm_last_sent` / `remind_last_sent` / `openpos_last_sent` / `alive_last_sent` / `scan_last_run` + รายสัปดาห์ `calendar_last_sent` เก็บ anchor วันอาทิตย์ล่าสุด), `port_settings.json` (ขนาดพอร์ตต่อ chat สำหรับคำนวณขนาดไม้), `trades_log.csv` (บันทึกไม้จริง — append-only เหมือน scan_log), `shadow_log.csv` (ไม้เงาที่ปิดแล้ว — cache สร้างใหม่ได้เสมอจาก scan_log), `f45_backlog.json` (คิว F45 ที่ยังไม่ได้อ่านตัวเลข — วันพีคเกินโควตาต่อรอบ)
 
 ไฟล์ log แบบ append (scan_log, lookup_log) คือข้อมูลสะสมที่ใช้วิเคราะห์ย้อนหลัง — เปลี่ยน schema คอลัมน์ต้องระวังไฟล์เก่าที่มีอยู่
 

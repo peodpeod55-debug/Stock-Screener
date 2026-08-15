@@ -6,6 +6,7 @@ import time
 import asyncio
 import datetime
 import logging
+import urllib.parse
 from logging.handlers import RotatingFileHandler
 
 from zoneinfo import ZoneInfo
@@ -27,6 +28,8 @@ import shadow
 import scanner
 import set_news
 import stock_core
+import ta_prompt
+import dashboard_feed
 from stock_core import (
     format_pct,
     format_signed_pct,
@@ -69,6 +72,13 @@ def _load_bot_token() -> str:
 
 
 BOT_TOKEN = _load_bot_token()
+
+# ── คำสั่ง "วิเคราะห์" (ข้อมูล PHASE 0 สำหรับ Gem เทคนิค) — อ่าน payload ของ Trading_Dashboard ──
+# ทั้งสามค่าตั้งใน .env (ดู .env.example) · GEM_TA_URL ผูกกับบัญชี Google รายคน ห้าม hardcode ลงโค้ด
+DASHBOARD_SITE_DIR = scanner._env_value("DASHBOARD_SITE_DIR")           # โฟลเดอร์ site ในเครื่อง (ว่าง = ใช้เว็บ)
+DASHBOARD_URL = scanner._env_value("DASHBOARD_URL", dashboard_feed.DEFAULT_URL)   # dashboard ที่ deploy (ต้นทางสำรอง)
+GEM_TA_URL = scanner._env_value("GEM_TA_URL", "https://gemini.google.com/gems/view")
+EARNINGS_RADAR_URL = "https://earningsradar.pages.dev/company/{sym}/"   # หน้างบรายบริษัท (เหมือนปุ่ม 📅 บน dashboard)
 
 # ── ข้อความยาว: Telegram จำกัด 4096 ตัวอักษร/ข้อความ ────────────
 # (ลิสต์ติดตามโตๆ หรือผลสแกนเยอะๆ จะเกิน) → ตัดแบ่งตามบรรทัด
@@ -269,7 +279,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    # ยาวใกล้เพดาน 3,900 แล้ว → ส่งผ่าน _reply_long (ตัดแบ่งตามบรรทัดให้เองถ้าเกิน)
+    await _reply_long(
+        update.message,
         "<b>วิธีใช้</b>\n\n"
         "• พิมพ์ ticker หุ้นไทยได้เลย (ไม่ต้องใส่ .BK)\n"
         "• หลายตัวพร้อมกัน (สูงสุด 10): <code>AOT PTT</code>\n"
@@ -324,13 +336,20 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>สถิติย้อนหลัง</b>\n"
         "• <code>สถิติ</code> — หุ้นติดสแกนแต่ละช่วงคะแนน\n"
         "  ผ่านไป 5/10/20 วัน ชนะกี่ % เฉลี่ยกี่ %\n\n"
+        "<b>📐 วิเคราะห์เทคนิคต่อด้วย Gem</b>\n"
+        "• <code>วิเคราะห์ AOT</code> — ข้อมูล PHASE 0 (ราคา/SMA/RSI/MACD/ATR/RS/วันงบ)\n"
+        "  จากระบบ dashboard เป็นบล็อกกดคัดลอกได้ + ปุ่มเปิด Gem เทคนิค\n"
+        "  → วางในแชท Gem พร้อมรูป Weekly + Daily แล้ว Gem วิเคราะห์เลย ไม่ถามกลับ\n"
+        "  (หรือกดปุ่ม 📐 ใต้ผลสแกน / สรุปงบ / ยืนยัน / ลิสต์)\n"
+        "• <code>คำอธิบายงบ AOT</code> — ลิงก์หน้างบของหุ้นตัวนั้นที่ Earnings Radar (ปุ่ม 📅)\n\n"
         "ทุกคำสั่งพิมพ์เป็นอังกฤษได้ (ตัวเล็ก-ใหญ่ไม่สำคัญ):\n"
         "<code>scan</code> / <code>news</code> / <code>digest</code> / "
         "<code>confirm</code> / <code>stats</code> / <code>earn AOT</code> / "
         "<code>calendar</code> / <code>shadow</code> / "
         "<code>watch AOT</code> / <code>unwatch AOT</code> / <code>list</code> / "
         "<code>port 500000</code> / <code>size AOT</code> / "
-        "<code>buy AOT 32.50</code> / <code>sell AOT 35</code> / <code>trades</code>",
+        "<code>buy AOT 32.50</code> / <code>sell AOT 35</code> / <code>trades</code> / "
+        "<code>ta AOT</code> / <code>mda AOT</code>",
         parse_mode="HTML",
     )
 
@@ -1258,37 +1277,123 @@ async def startup_calendar_job(context: ContextTypes.DEFAULT_TYPE):
     await _run_calendar(context, "startup earnings calendar")
 
 
-# ── ปุ่ม "➕ ติดตาม" ใต้ผลสแกน/สรุปงบ (กดแล้วเข้าลิสต์ทันที) ─────
+# ── ปุ่มใต้ผลสแกน/สรุปงบ/ยืนยัน: หุ้นละแถว [➕ ติดตาม] [📐 PHASE 0] [📅 หน้างบ] ─────
 # รับได้ทั้ง dict ผลสแกน ({"ticker": ...}) และชื่อหุ้นเปล่าๆ (จากสรุปงบ)
+# 📐 = callback ta:SYM (คำสั่ง "วิเคราะห์" ตัวเดียวกัน) · 📅 = ลิงก์ Earnings Radar ไม่มี callback
+
+def _earnings_url(sym: str) -> str:
+    return EARNINGS_RADAR_URL.format(sym=urllib.parse.quote(sym))
+
+
+def _stock_row(base: str):
+    return [
+        InlineKeyboardButton(f"➕ {base}", callback_data=f"watch:{base}"),
+        InlineKeyboardButton(f"📐 {base}", callback_data=f"ta:{base}"),
+        InlineKeyboardButton(f"📅 {base}", url=_earnings_url(base)),
+    ]
+
 
 def _watch_buttons(hits, limit=15):
     if not hits:
         return None
-    rows, row = [], []
+    rows = []
     for d in hits[:limit]:
         base = (d["ticker"] if isinstance(d, dict) else d).replace(".BK", "")
-        row.append(InlineKeyboardButton(f"➕ {base}", callback_data=f"watch:{base}"))
-        if len(row) == 3:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
+        rows.append(_stock_row(base))
     return InlineKeyboardMarkup(rows)
 
 
-def _unwatch_buttons(symbols, limit=15):
-    """ปุ่ม 🗑 เอาออกจากลิสต์ (ใต้สรุป "ลิสต์" — เฉพาะตัวที่หมดสภาพ)"""
-    if not symbols:
-        return None
+def _rows_of(symbols, limit, make):
+    """จัดปุ่ม 3 ปุ่มต่อแถว → list ของแถว (ไม่ห่อ InlineKeyboardMarkup ให้เอาไปต่อกันได้)"""
     rows, row = [], []
-    for s in symbols[:limit]:
-        row.append(InlineKeyboardButton(f"🗑 {s}", callback_data=f"unwatch:{s}"))
+    for s in (symbols or [])[:limit]:
+        row.append(make(s))
         if len(row) == 3:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    return InlineKeyboardMarkup(rows)
+    return rows
+
+
+def _unwatch_rows(symbols, limit=15):
+    """แถวปุ่ม 🗑 เอาออกจากลิสต์ (ใต้สรุป "ลิสต์" — เฉพาะตัวที่หมดสภาพ)"""
+    return _rows_of(symbols, limit,
+                    lambda s: InlineKeyboardButton(f"🗑 {s}", callback_data=f"unwatch:{s}"))
+
+
+def _ta_rows(symbols, limit=15):
+    """แถวปุ่ม 📐 ข้อมูล PHASE 0 ของหุ้นในลิสต์ (กดต่อได้โดยไม่ต้องพิมพ์ชื่อ)"""
+    return _rows_of(symbols, limit,
+                    lambda s: InlineKeyboardButton(f"📐 {s}", callback_data=f"ta:{s}"))
+
+
+def _list_buttons(stale, symbols, limit=15):
+    """คีย์บอร์ดใต้ "ลิสต์": 🗑 ของตัวหมดสภาพ ต่อด้วย 📐 ของทุกตัวในลิสต์ (15 ตัวแรก)"""
+    rows = _unwatch_rows(stale, limit) + _ta_rows(symbols, limit)
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+# ── คำสั่ง "วิเคราะห์ XXX" / ปุ่ม 📐 → ข้อความ PHASE 0 สำหรับ Gem เทคนิค ─────
+# อ่าน payload ของ Trading_Dashboard (dashboard_feed) → ประกอบข้อความเท่ากับปุ่ม 📐 บนเว็บ (ta_prompt)
+# ส่งเป็น <pre> ให้กดคัดลอกทั้งก้อนได้ + ปุ่มลิงก์เปิด Gem — บอทไม่วิเคราะห์เอง ผู้ใช้เอาไปวางใน Gem พร้อมรูป
+
+_TA_USAGE = (
+    "📐 <b>วิเคราะห์เทคนิคต่อด้วย Gem</b>\n"
+    "พิมพ์ <code>วิเคราะห์ AOT</code> (หรือ <code>ta AOT</code>) — บอทส่งข้อมูล PHASE 0 ของหุ้นตัวนั้น\n"
+    "เป็นบล็อกกดคัดลอกได้ แล้วเปิด Gem จากปุ่ม → วางพร้อมรูป Weekly + Daily\n"
+    "หรือกดปุ่ม 📐 ใต้ผลสแกน / สรุปงบ / ยืนยัน / ลิสต์ ได้เลยไม่ต้องพิมพ์ชื่อ"
+)
+_MDA_USAGE = (
+    "📅 พิมพ์ <code>คำอธิบายงบ AOT</code> (หรือ <code>mda AOT</code>) — "
+    "ลิงก์หน้างบ/คำอธิบายผลประกอบการของหุ้นตัวนั้นที่ Earnings Radar"
+)
+_SYMBOL_RE = re.compile(r"[A-Z0-9.&-]{1,15}")
+
+
+async def _ta_reply(message, raw_symbol: str):
+    """ตอบข้อความ PHASE 0 ของหุ้นหนึ่งตัว (ใช้ร่วมระหว่างคำสั่ง "วิเคราะห์" และ callback ta:SYM)"""
+    sym = stock_core._base_symbol(raw_symbol or "")
+    if not sym or not _SYMBOL_RE.fullmatch(sym):
+        await message.reply_text(_TA_USAGE, parse_mode="HTML")
+        return
+    try:
+        stock, meta = await asyncio.to_thread(
+            dashboard_feed.load_stock, sym, "TH",
+            site_dir=DASHBOARD_SITE_DIR, url=DASHBOARD_URL,
+            max_age_days=scanner.LOCAL_MAX_AGE_DAYS,
+        )
+    except dashboard_feed.DashboardUnavailable as e:
+        await message.reply_text(
+            f"⚠️ {html.escape(str(e))}\n"
+            "ตรวจ DASHBOARD_SITE_DIR / DASHBOARD_URL ใน .env หรือรอ dashboard สร้างข้อมูลรอบใหม่",
+            parse_mode="HTML",
+        )
+        return
+    asof = meta.get("asof") or meta.get("core_asof") or "ไม่ทราบวันที่"
+    if stock is None:
+        await message.reply_text(
+            f"ไม่มี <b>{html.escape(sym)}</b> ในระบบ dashboard (ข้อมูล build {html.escape(str(asof))}) — "
+            "หุ้นนอก universe ของ screener ต้องหาข้อมูล PHASE 0 เอง",
+            parse_mode="HTML",
+        )
+        return
+    body = ta_prompt.build_ta_prompt(stock, meta, stock_core.next_earnings_date(sym))
+    session = "ระหว่างวัน" if meta.get("intraday") else "ปิดตลาดแล้ว"
+    lines = [f"📐 ข้อมูล PHASE 0 · <b>{html.escape(sym)}</b> (ข้อมูล {html.escape(str(asof))} · {session})"]
+    if meta.get("stale"):
+        lines.append(f"⚠️ ข้อมูลเก่า {meta.get('age_days')} วัน — dashboard ยังไม่ได้อัปเดต "
+                     "ตัดสินเองว่ายังใช้ได้ไหม (swing ใช้ EOD เก่า 1-2 วันยังพอได้)")
+    lines.append("กดค้างที่บล็อกด้านล่างเพื่อคัดลอก แล้ววางในแชท Gem พร้อมรูป Weekly + Daily")
+    text = "\n".join(lines) + f"\n\n<pre>{html.escape(body)}</pre>"
+    # ส่งตรง ไม่ผ่าน _reply_long — ตัวนั้นตัดตามบรรทัดจะผ่ากลาง <pre> แล้ว HTML พัง
+    # (ความยาวถูกจำกัดด้วยโครงเทมเพลต ≈1,400 ตัวอักษร มีเทสต์ยืนยันขอบบน)
+    await message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📐 เปิด Gem เทคนิค", url=GEM_TA_URL)]]),
+    )
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1323,6 +1428,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         else:
             await q.answer("ตัวนี้ไม่อยู่ในลิสต์แล้ว (กดซ้ำ?)")
+    elif data.startswith("ta:"):
+        # ตอบ callback ก่อนทำงาน (Telegram หมดอายุปุ่มใน ~15 วิ) แล้วค่อยส่งบล็อก PHASE 0
+        # เป็นข้อความใหม่ — handler เดียวกับคำสั่ง "วิเคราะห์"
+        await q.answer("⏳ กำลังดึงข้อมูล PHASE 0...")
+        try:
+            await _ta_reply(q.message, data.split(":", 1)[1])
+        except Exception:
+            log.exception("ta callback failed")
     else:
         await q.answer()
 
@@ -2272,8 +2385,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result, stale = await asyncio.to_thread(
             build_watchlist_summary, update.effective_chat.id
         )
+        symbols = stock_core.get_watchlist(update.effective_chat.id)
         await _reply_long(update.message, result,
-                          reply_markup=_unwatch_buttons(stale), parse_mode="HTML")
+                          reply_markup=_list_buttons(stale, symbols), parse_mode="HTML")
+        return
+
+    # ข้อมูล PHASE 0 สำหรับ Gem เทคนิค: "วิเคราะห์ AOT" (ตัวเดียวกับปุ่ม 📐)
+    if tickers and tickers[0].lower() in ("วิเคราะห์", "ta"):
+        if len(tickers) < 2:
+            await update.message.reply_text(_TA_USAGE, parse_mode="HTML")
+            return
+        await _ta_reply(update.message, tickers[1])
+        return
+
+    # ลิงก์หน้างบที่ Earnings Radar: "คำอธิบายงบ AOT" — แค่ประกอบลิงก์ ไม่ยิงเว็บ ไม่เช็คว่ามีหน้านั้นจริง
+    if tickers and tickers[0].lower() in ("คำอธิบายงบ", "mda"):
+        if len(tickers) < 2:
+            await update.message.reply_text(_MDA_USAGE, parse_mode="HTML")
+            return
+        sym = stock_core._base_symbol(tickers[1])
+        if not _SYMBOL_RE.fullmatch(sym):
+            await update.message.reply_text(_MDA_USAGE, parse_mode="HTML")
+            return
+        await update.message.reply_text(
+            f"📅 คำอธิบายงบ / ผลประกอบการของ <b>{html.escape(sym)}</b> ที่ Earnings Radar",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton(f"📅 เปิด Earnings Radar — {sym}", url=_earnings_url(sym))]]),
+        )
         return
 
     if len(tickers) > MAX_TICKERS:

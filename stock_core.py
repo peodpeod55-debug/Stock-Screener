@@ -224,6 +224,25 @@ def upcoming_earnings(days: int = 14):
     return out
 
 
+def today_bkk() -> datetime.date:
+    """วันที่ปัจจุบันตามเวลาไทย (ใช้แทน date.today() ในโค้ดใหม่ — เครื่อง/VPS อาจตั้ง timezone อื่น)"""
+    return datetime.datetime.now(_BKK).date()
+
+
+def next_earnings_date(ticker_input: str):
+    """วันประกาศงบถัดไปจากคลังในเครื่องล้วนๆ — ไม่ยิงเน็ต (ต่างจาก get_stock_data ที่อาจดึง Yahoo)
+
+    วันที่บันทึกเอง/จากข่าว SET (manual) ชนะวันจาก Yahoo (auto) — กติกาเดียวกับ next_earn
+    ใน _fetch_stock_data · หุ้นที่ยังไม่เคยถูกดูเลยจะไม่มีในคลัง → None (ให้ผู้เรียกเขียน "ไม่มีข้อมูล")
+    ใช้ทำบรรทัด ข.8 ของข้อความ PHASE 0 (คำสั่ง "วิเคราะห์")"""
+    entry = _EARN_STORE.get(_base_symbol(ticker_input), {})
+    manual = _parse_iso_dates(entry.get("manual_dates", []))
+    auto = _parse_iso_dates(entry.get("auto_dates", []))
+    today = today_bkk()
+    return (min((d for d in manual if d > today), default=None)
+            or min((d for d in auto if d > today), default=None))
+
+
 def _get_earnings_dates(stock, used_ticker):
     """รวมวันงบจาก Yahoo (refresh วันละครั้ง) + ที่บันทึกเอง
 

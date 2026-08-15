@@ -76,7 +76,12 @@ python backtest.py            # backtest ระบบคะแนนกับข
 ลิสต์                # ดูรายการที่ติดตามอยู่
 งบ AOT 13/11/2569    # บันทึกวันงบเอง (แม่นกว่า Yahoo)
 สถิติ                # ดูสถิติย้อนหลังว่าคะแนนทำนายได้จริงไหม
+วิเคราะห์ AOT         # ข้อมูล PHASE 0 สำหรับ Gem เทคนิค (บล็อกคัดลอก + ปุ่มเปิด Gem)
+คำอธิบายงบ AOT        # ลิงก์หน้างบของหุ้นที่ Earnings Radar
 ```
+
+ใต้ผลสแกน / สรุปงบ / ยืนยัน / ลิสต์ มีปุ่ม `➕` (ติดตาม) `📐` (PHASE 0) `📅` (หน้างบ) ต่อหุ้น
+กดต่อได้เลยไม่ต้องพิมพ์ชื่อซ้ำ
 
 ดูคู่มือเต็มใน [`คู่มือการใช้งาน.txt`](คู่มือการใช้งาน.txt)
 
@@ -92,6 +97,19 @@ python backtest.py            # backtest ระบบคะแนนกับข
 ตอนนำสองโปรเจกต์ไปรวมบน VPS เดียวกัน แค่ตั้ง `DASHBOARD_TH_CACHE` ให้ชี้ไปที่โฟลเดอร์
 `data_cache/TH` ของ Trading_Dashboard ก็เชื่อมกันได้ทันที
 
+**คำสั่ง `วิเคราะห์ XXX` / ปุ่ม 📐** อ่านคนละส่วนของ Trading_Dashboard: payload JSON ที่หน้าเว็บใช้
+(`site/data/manifest.json` → `data/<build>/stocks-TH.json` + `core.json`) แล้วประกอบข้อความ PHASE 0
+ชุดเดียวกับปุ่ม 📐 บน dashboard ให้กดคัดลอกจาก Telegram ไปวางใน Gem เทคนิคได้ (`ta_prompt.py` port
+`taPrompt()` ของ dashboard มาตัวต่อตัว — เทสต์กัน drift ใน `tests/`) — ตั้งค่าใน `.env`:
+
+| คีย์ | ค่า |
+|---|---|
+| `DASHBOARD_SITE_DIR` | โฟลเดอร์ `site` ของ Trading_Dashboard ในเครื่อง (อ่านไฟล์ตรง) — เว้นว่าง = ใช้เว็บ |
+| `DASHBOARD_URL` | dashboard ที่ deploy (ต้นทางสำรอง เมื่อไม่มีโฟลเดอร์/ข้อมูลเก่ากว่า 5 วัน) — default `https://sakura.peodbot.com` |
+| `GEM_TA_URL` | ลิงก์ Gem เทคนิคของคุณ (`https://gemini.google.com/gem/…`) สำหรับปุ่ม "📐 เปิด Gem เทคนิค" — เว้นว่าง = หน้ารายการ Gems |
+
+บอทไม่วิเคราะห์เอง ไม่เรียก Gemini API และไม่แก้ไฟล์ของ Trading_Dashboard (อ่านอย่างเดียว)
+
 ## โครงสร้างโปรเจกต์
 
 | ไฟล์ | หน้าที่ |
@@ -101,6 +119,8 @@ python backtest.py            # backtest ระบบคะแนนกับข
 | `scanner.py` | สแกนหุ้นตอบรับงบ (2 โหมด: universe / ทั้งตลาด) |
 | `set_news.py` | ดึงข่าวแจ้งงบจากเว็บ SET ผ่าน Playwright |
 | `stats.py` / `backtest.py` | วิเคราะห์ย้อนหลัง / backtest ระบบคะแนน |
+| `ta_prompt.py` / `dashboard_feed.py` | ข้อความ PHASE 0 สำหรับ Gem เทคนิค / อ่าน payload ของ Trading_Dashboard |
+| `tests/` | `python -m pytest` — เทสต์ส่วน "วิเคราะห์" (ไม่แตะเน็ต; drift test เทียบกับ JS ของ dashboard ผ่าน Node) |
 
 ดูรายละเอียดสถาปัตยกรรมใน [`CLAUDE.md`](CLAUDE.md) และเอกสารประกอบ:
 [`วงจรระบบ.txt`](วงจรระบบ.txt), [`workflow เทรดหลังงบ.txt`](workflow%20เทรดหลังงบ.txt)
