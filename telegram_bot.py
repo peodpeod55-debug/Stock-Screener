@@ -12,7 +12,7 @@ from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
 
 from yfinance.exceptions import YFRateLimitError
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import BotCommand, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import NetworkError
 from telegram.ext import (
     ApplicationBuilder,
@@ -349,7 +349,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>watch AOT</code> / <code>unwatch AOT</code> / <code>list</code> / "
         "<code>port 500000</code> / <code>size AOT</code> / "
         "<code>buy AOT 32.50</code> / <code>sell AOT 35</code> / <code>trades</code> / "
-        "<code>ta AOT</code> / <code>mda AOT</code>",
+        "<code>ta AOT</code> / <code>mda AOT</code>\n\n"
+        "หรือกดปุ่มเมนู ☰ (พิมพ์ <code>/</code>) — ทุกคำสั่งอยู่ในเมนูพร้อม"
+        "คำอธิบาย เช่น <code>/scan</code> <code>/watch AOT</code> <code>/list</code>",
         parse_mode="HTML",
     )
 
@@ -2078,7 +2080,12 @@ def build_trades_report(chat_id) -> str:
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _register_chat(update.effective_chat.id)
-    text = update.message.text.strip()
+    await _dispatch_text(update, context, update.message.text)
+
+
+async def _dispatch_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                         raw_text: str):
+    text = raw_text.strip()
     tickers = text.split()
 
     # สแกนทั้งกระดานเดี๋ยวนี้: "สแกน"
@@ -2433,6 +2440,62 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(0.5)
 
 
+# ── เมนู "/" ใน Telegram (setMyCommands ตอน start) — ชื่อ a-z0-9_ ≤32, คำอธิบาย ≤256 · ลำดับ = ลำดับในเมนู ──
+
+BOT_COMMANDS = [
+    ("scan", "สแกนหุ้นตอบรับงบดีทั้งกระดานเดี๋ยวนี้ (~1-3 นาที) — เกณฑ์ ≥2% + วอลุ่ม ≥1.5 เท่า"),
+    ("list", "ลิสต์หุ้นที่ติดตาม เรียงตามคะแนนสัญญาณหลังงบ (+ปุ่ม 📐 / 🗑 ตัวหมดสภาพ)"),
+    ("watch", "ติดตามหุ้น: /watch AOT — บอทเฝ้าช่วงตลาดเปิด เด้งเมื่อ 🔥 ทะลุไฮ / ⛔ หลุด Low ก่อนงบ"),
+    ("unwatch", "เลิกติดตาม: /unwatch AOT (หลายตัวพร้อมกันได้)"),
+    ("price", "ดูหุ้นรายตัว: /price AOT — ราคา วอลุ่ม วันงบ ไฮ-โลว์ คะแนน (หรือพิมพ์ ticker ตรงๆ)"),
+    ("ta", "ข้อมูล PHASE 0 สำหรับ Gem เทคนิค: /ta AOT — บล็อกกดคัดลอก + ปุ่มเปิด Gem (ปุ่ม 📐)"),
+    ("digest", "สรุปงบเช้า: ใครแจ้งงบเย็นวาน+เช้านี้ เรียงตามกำไรโต (ใส่เลข = ย้อน N วัน)"),
+    ("confirm", "ยืนยันรอบเช้า: ตลาดตอบรับหุ้นงบโตแรงเมื่อคืนยังไง (gap + วอลุ่มสะสม)"),
+    ("news", "เช็คข่าวแจ้งงบจากเว็บ SET เดี๋ยวนี้ (~1 นาที ถ้ามี F45 ให้อ่านตัวเลข)"),
+    ("calendar", "ปฏิทินงบ 14 วันข้างหน้า จากคลังวันงบในเครื่อง"),
+    ("earn", "วันงบรายตัว: /earn AOT — ดู · /earn AOT 13/11/2569 — บันทึกเอง (manual ชนะ Yahoo)"),
+    ("stats", "สถิติย้อนหลัง: หุ้นติดสแกนแต่ละช่วงคะแนน ผ่านไป 5/10/20 วัน ชนะกี่ % + ไม้เงา/ไม้จริง"),
+    ("shadow", "ไม้เงา: จำลองเทรดทุกตัวที่ติดสแกน เข้าเปิดวันถัดไป ตัดหลุด ⛔ ถือสูงสุด 20 วัน"),
+    ("port", "ตั้ง/ดูขนาดพอร์ต: /port 500000 — ใช้คำนวณขนาดไม้ (เสี่ยง 1% ต่อไม้)"),
+    ("size", "คำนวณขนาดไม้: /size AOT — ซื้อกี่หุ้นให้หลุด ⛔ แล้วเสียแค่ 1% ของพอร์ต"),
+    ("buy", "จดไม้เข้า: /buy AOT 32.50 พร้อมเก็บคะแนน/เส้น ⛔ ณ ตอนเข้า (ใส่จำนวนหุ้นต่อท้ายได้)"),
+    ("sell", "ปิดไม้: /sell AOT 35.00 — สรุป % กำไรและ R ทันที"),
+    ("trades", "ไม้ที่เปิดอยู่ + ผลไม้ที่ปิดแล้ว"),
+    ("mda", "ลิงก์คำอธิบายงบของหุ้นตัวนั้นที่ Earnings Radar: /mda AOT (ปุ่ม 📅)"),
+    ("help", "วิธีใช้ทั้งหมด (คำสั่งพิมพ์ไทย + ตารางเวลาอัตโนมัติ)"),
+]
+# slash → ข้อความที่ส่งเข้า dispatcher เดิม — ชื่อ slash ตรงกับ alias อังกฤษของทุกคำสั่งอยู่แล้ว
+# ยกเว้น "price": ตัดคำสั่งทิ้ง เหลือ ticker เพียวๆ เข้าโหมดดูหุ้นรายตัว (help มี handler ตรงอยู่แล้ว)
+SLASH_ALIASES = {c: c for c, _ in BOT_COMMANDS if c != "help"}
+SLASH_ALIASES["price"] = ""
+
+
+async def cmd_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """slash alias ของคำสั่งพิมพ์ไทย (เมนู "/" ของ Telegram รับได้เฉพาะ slash):
+    /watch AOT → "watch AOT" · /price AOT → "AOT" เข้า _dispatch_text เดิม — ไม่มี logic ซ้ำ"""
+    _register_chat(update.effective_chat.id)
+    cmd = update.message.text.split()[0].lstrip("/").split("@")[0].lower()
+    word = SLASH_ALIASES.get(cmd)
+    if word is None:
+        return
+    text = " ".join([word, *(context.args or [])]).strip()
+    if not text:  # /price เปล่าๆ — ปล่อยเข้า dispatcher จะกลายเป็นข้อความว่าง
+        await update.message.reply_text(
+            "พิมพ์ <code>/price AOT</code> หรือพิมพ์ ticker ตรงๆ เช่น "
+            "<code>AOT PTT</code>", parse_mode="HTML")
+        return
+    await _dispatch_text(update, context, text)
+
+
+async def register_commands(app):
+    """post_init: ลงทะเบียนเมนูคำสั่ง "/" กับ Telegram — ล้ม (เน็ตล่ม) แค่ log ไม่ให้บอทตาย"""
+    try:
+        await app.bot.set_my_commands([BotCommand(c, d) for c, d in BOT_COMMANDS])
+        log.info("เมนูคำสั่ง Telegram ลงทะเบียนแล้ว %d รายการ", len(BOT_COMMANDS))
+    except Exception as e:
+        log.warning("set_my_commands failed: %s", e)
+
+
 # main
 
 def main():
@@ -2456,9 +2519,10 @@ def main():
     print(f"  ปฏิทินงบสัปดาห์ละครั้ง เวลา {CALENDAR_HOUR:02d}:{CALENDAR_MINUTE:02d} น. "
           "(ปกติเย็นวันอาทิตย์)\n")
     log.info("bot starting")
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(register_commands).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler(list(SLASH_ALIASES), cmd_alias))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(on_error)
