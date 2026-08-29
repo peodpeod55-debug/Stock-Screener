@@ -57,8 +57,9 @@ python backtest.py            # backtest ระบบคะแนนกับข
 
 ### Windows (แนะนำสำหรับเครื่องส่วนตัว)
 
-- `เริ่ม Bot.bat` — รันบอทพร้อม auto-restart ใน 15 วินาทีถ้า crash (Ctrl+C = ปิดปกติ)
-- `ติดตั้งเปิดเองตอนบูต.bat` — ลงทะเบียนให้บอทเปิดเองตอนบูตเครื่อง
+- `เริ่ม Bot.bat` — รันบอทแบบเห็นหน้าต่าง พร้อม auto-restart ใน 15 วินาทีถ้า crash (Ctrl+C = ปิดปกติ) · ถ้ามีบอทอีกตัวรันอยู่แล้ว (lock port 48952) จะบอกแล้วปิดตัวเอง ไม่วน restart
+- `run_bot.bat` + `start_bot_hidden.vbs` — แบบไม่มีหน้าต่าง (ใช้กับ autostart)
+- `ติดตั้งเปิดเองตอนบูต.bat` — สร้างทางลัด `StockLookupBot.lnk` ใน Startup ให้บอทเปิดเองตอนบูตเครื่องแบบซ่อนหน้าต่าง
 
 ### Linux / VPS
 
@@ -120,7 +121,7 @@ python backtest.py            # backtest ระบบคะแนนกับข
 | `set_news.py` | ดึงข่าวแจ้งงบจากเว็บ SET ผ่าน Playwright |
 | `stats.py` / `backtest.py` | วิเคราะห์ย้อนหลัง / backtest ระบบคะแนน |
 | `ta_prompt.py` / `dashboard_feed.py` | ข้อความ PHASE 0 สำหรับ Gem เทคนิค / อ่าน payload ของ Trading_Dashboard |
-| `tests/` | `python -m pytest` — เทสต์ส่วน "วิเคราะห์" (ไม่แตะเน็ต; drift test เทียบกับ JS ของ dashboard ผ่าน Node) |
+| `tests/` | `python -m pytest` — `conftest.py` บล็อกเน็ตทุกทางและชี้ไฟล์ state ไป tmp (เทสต์ที่ลืม stub ล้มทันที ไม่แตะของจริง); drift test เทียบกับ JS ของ dashboard ผ่าน Node · CI รันบน GitHub ทุก push/PR |
 
 ดูรายละเอียดสถาปัตยกรรมใน [`CLAUDE.md`](CLAUDE.md) และเอกสารประกอบ:
 [`วงจรระบบ.txt`](วงจรระบบ.txt), [`workflow เทรดหลังงบ.txt`](workflow%20เทรดหลังงบ.txt)

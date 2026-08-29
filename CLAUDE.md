@@ -23,15 +23,18 @@ python shadow.py              # ไม้เงา — จำลองเทร�
 python backtest.py            # backtest ระบบคะแนนกับข้อมูล ~2 ปี (ใช้เวลา 5-10 นาที)
 ```
 
-- `เริ่ม Bot.bat` — รันบอทพร้อม auto-restart ใน 15 วินาทีถ้า crash (Ctrl+C = ปิดปกติ ไม่วนกลับ)
-- `ติดตั้งเปิดเองตอนบูต.bat` — ลงทะเบียนให้บอทเปิดเองตอนบูตเครื่อง
-- `python -m pytest` — เทสต์ใน `tests/` (ไม่แตะเน็ต) ครอบคลุมเฉพาะส่วน "วิเคราะห์"/PHASE 0 (`ta_prompt`, `dashboard_feed`, `next_earnings_date`, ปุ่ม/handler ใหม่) + เมนู "/" (`test_commands_menu.py`) — โมดูลเก่ายังไม่มีเทสต์ ตรวจด้วยการรันสคริปต์นั้นตรงๆ (ทุกโมดูลรันเดี่ยวได้) · `tests/test_ta_prompt_matches_dashboard.py` รัน `taPrompt()` ตัวจริงจาก `market_dashboard.js` ใน Node มาเทียบ (skip ถ้าไม่มี node/ไฟล์ dashboard)
+- `เริ่ม Bot.bat` — รันบอทแบบเห็นหน้าต่าง พร้อม auto-restart ใน 15 วินาทีถ้า crash (Ctrl+C = ปิดปกติ ไม่วนกลับ) · exit code 3 = มีบอทอีก instance ถือ lock อยู่ → ไม่วน restart
+- `run_bot.bat` + `start_bot_hidden.vbs` — loop เดียวกันแบบไม่มีหน้าต่าง (โครงเดียวกับบอท HK/US) ใช้กับ autostart
+- `ติดตั้งเปิดเองตอนบูต.bat` — สร้าง `StockLookupBot.lnk` ใน Startup → `wscript start_bot_hidden.vbs` (ลบ .bat ตัวติดตั้งเก่าที่เปิดหน้าต่างให้ด้วย)
+- กันรันซ้อน: `instance_lock.py` จอง TCP port **48952** บน localhost ตลอดอายุ process (US 48962 / HK 48972 — รันคู่กันได้) · รันซ้อน = `SystemExit(3)` ก่อนแตะ Telegram
+- `python -m pytest` — เทสต์ใน `tests/` · `tests/conftest.py` **บล็อกเน็ตทุกทาง** (urllib / curl_cffi·yfinance / requests / httpx / playwright → `NetworkBlocked` ซึ่งเป็น BaseException ทะลุ `except Exception` ของโค้ดจริง) และ **redirect ไฟล์ state** (chat_ids / watchlist / digest_state / .yf_cache ฯลฯ) ไป tmp — เทสต์ที่ลืม stub ล้มทันที ไม่แตะของจริง · CI: `.github/workflows/ci.yml` รันชุดนี้บน push/PR (Python 3.12 + 3.14) · ครอบคลุมเฉพาะส่วน "วิเคราะห์"/PHASE 0 (`ta_prompt`, `dashboard_feed`, `next_earnings_date`, ปุ่ม/handler ใหม่) + เมนู "/" (`test_commands_menu.py`) — โมดูลเก่ายังไม่มีเทสต์ ตรวจด้วยการรันสคริปต์นั้นตรงๆ (ทุกโมดูลรันเดี่ยวได้) · `tests/test_ta_prompt_matches_dashboard.py` รัน `taPrompt()` ตัวจริงจาก `market_dashboard.js` ใน Node มาเทียบ (skip ถ้าไม่มี node/ไฟล์ dashboard)
 
 ## สถาปัตยกรรม
 
 ```
 telegram_bot.py   ← entry point: handler + scheduled jobs ทั้งหมด
   ├── stock_core.py   ← โมดูลกลาง: ดึงข้อมูล Yahoo, คำนวณสัญญาณ, คะแนน, watchlist, คลังวันงบ
+  ├── instance_lock.py ← กันรันซ้อน: จอง TCP port 48952 (port จากบอท US)
   ├── scanner.py      ← สแกนหุ้นตอบรับงบ (เกณฑ์: ตอบรับ ≥2%, วอลุ่ม ≥1.5 เท่า)
   ├── set_news.py     ← ดึงข่าวแจ้งงบจากเว็บ SET ผ่าน Playwright
   ├── stats.py        ← สถิติจาก scan_log.csv (+สรุปไม้เงาจาก cache)
