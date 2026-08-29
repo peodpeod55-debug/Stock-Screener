@@ -55,7 +55,8 @@ def _state_in_tmp(monkeypatch, tmp_path):
     import stock_core
     import telegram_bot as tb
 
-    for name in ("_CHAT_IDS_PATH", "_ALIVE_PATH", "_DIGEST_STATE_PATH", "_WATCH_STATE_PATH", "_PORT_SETTINGS_PATH"):
+    for name in ("_CHAT_IDS_PATH", "_ALIVE_PATH", "_DIGEST_STATE_PATH", "_WATCH_STATE_PATH", "_PORT_SETTINGS_PATH",
+                 "_HOLIDAYS_PATH"):
         monkeypatch.setattr(tb, name, str(tmp_path / os.path.basename(getattr(tb, name))))
     for name in ("_WATCHLIST_PATH", "_TRADES_LOG_PATH", "_LOOKUP_LOG_PATH", "_NAME_CACHE_PATH", "_EARN_STORE_PATH"):
         monkeypatch.setattr(stock_core, name, str(tmp_path / os.path.basename(getattr(stock_core, name))))
