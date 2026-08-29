@@ -555,6 +555,47 @@ async def _broadcast(bot, chat_ids, text: str):
             log.exception("broadcast failed (chat %s)", cid)
 
 
+# ── job รายวันล้มต้องไม่เงียบ: นับครั้ง + แจ้งผู้ใช้ + ให้ catch-up ลองใหม่ (แนวคิดจากบอท HK/US) ──
+# key รายวันใน digest_state ("เขียนเฉพาะเมื่อส่งถึง") ทำหน้าที่ claim อยู่แล้ว — ตรงนี้เพิ่มแค่
+# (1) exception จากขั้น build หลุดออกมาแทนกลืนเงียบ (2) นับครั้ง/แจ้ง (3) catchup_job วนเก็บทุก 30 นาที
+JOB_MAX_TRIES = 3               # ล้มครบเท่านี้ต่อวัน = หยุดลอง (กันสแปม/เผา Yahoo)
+CATCHUP_INTERVAL = 30 * 60      # วินาที — catchup_job วนเก็บ job ที่พลาด/ล้ม
+CATCHUP_FIRST = 600             # รอบแรกหลัง startup burst (startup_scan_job วินาที 450) จบก่อน
+_fail_counts = {}               # (job, วัน ISO) → จำนวนครั้งที่ล้มวันนี้ (ใน memory — restart เริ่มนับใหม่)
+_done = {}                      # (job, วัน ISO) → True เมื่อ core จบโดยไม่ล้ม (ส่งแล้ว/ไม่มีอะไรส่ง) — catch-up ข้าม
+
+
+def _job_key(name: str):
+    return (name, datetime.datetime.now(ZoneInfo("Asia/Bangkok")).date().isoformat())
+
+
+async def _run_guarded(context: ContextTypes.DEFAULT_TYPE, name: str, label: str, core):
+    """เรียก core() (= _run_X) — exception หลุดออกมาคือล้ม → นับครั้ง + broadcast ให้ผู้ใช้รู้
+
+    key รายวันของ core ไม่ถูกเขียน (เขียนเฉพาะเมื่อส่งถึง) → catchup_job ลองใหม่เอง ·
+    ครบ JOB_MAX_TRIES → แจ้งว่าหยุดลองวันนี้ แล้วไม่เรียก core อีกจนกว่าจะวันใหม่/restart ·
+    สำเร็จ → จด _done และล้างตัวนับ (ล้มแล้วสำเร็จทีหลัง = จบเรื่อง)"""
+    key = _job_key(name)
+    if _fail_counts.get(key, 0) >= JOB_MAX_TRIES:
+        return
+    try:
+        await core()
+    except Exception as e:
+        log.exception("%s failed", label)
+        _fail_counts[key] = tries = _fail_counts.get(key, 0) + 1
+        if tries < JOB_MAX_TRIES:
+            note = (f"⚠️ {label} ล้มเหลว: {html.escape(str(e))}\n"
+                    f"จะลองใหม่อัตโนมัติภายใน ~{CATCHUP_INTERVAL // 60} นาที "
+                    f"(ครั้งที่ {tries}/{JOB_MAX_TRIES})")
+        else:
+            note = (f"⚠️ {label} ล้มเหลวครบ {JOB_MAX_TRIES} ครั้ง — "
+                    "หยุดลองสำหรับวันนี้ (ดู bot_log.txt)")
+        await _broadcast(context.bot, _load_chat_ids(), note)
+        return
+    _done[key] = True
+    _fail_counts.pop(key, None)
+
+
 async def news_monitor_job(context: ContextTypes.DEFAULT_TYPE):
     global _news_fail_count, _news_fail_alerted
     now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
@@ -789,11 +830,8 @@ async def _run_morning_digest(context: ContextTypes.DEFAULT_TYPE, label: str):
     _digest_in_flight = True
     try:
         since_dt = _digest_window_start(now)
-        try:
-            text, hot = await asyncio.to_thread(build_morning_digest, since_dt, now)
-        except Exception:
-            log.exception("%s failed", label)
-            return
+        # build ล้ม → ปล่อย exception ถึง _run_guarded (นับครั้ง + แจ้งผู้ใช้) ไม่กลืนเงียบอีกต่อไป
+        text, hot = await asyncio.to_thread(build_morning_digest, since_dt, now)
         if not text:
             return
         buttons = _watch_buttons(hot)
@@ -818,7 +856,8 @@ async def _run_morning_digest(context: ContextTypes.DEFAULT_TYPE, label: str):
 
 async def morning_digest_job(context: ContextTypes.DEFAULT_TYPE):
     """job รายวัน 08:55: สรุปงบเช้า"""
-    await _run_morning_digest(context, "morning digest")
+    await _run_guarded(context, "digest", "สรุปงบเช้า",
+                       lambda: _run_morning_digest(context, "morning digest"))
 
 
 async def startup_digest_job(context: ContextTypes.DEFAULT_TYPE):
@@ -828,7 +867,8 @@ async def startup_digest_job(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
     if now.time() >= datetime.time(16, 30):
         return
-    await _run_morning_digest(context, "startup morning digest")
+    await _run_guarded(context, "digest", "สรุปงบเช้า",
+                       lambda: _run_morning_digest(context, "startup morning digest"))
 
 
 # ── ยืนยันรอบเช้า (10:30): ตลาดตอบรับหุ้นงบโตแรงเมื่อคืนยังไง ───
@@ -960,11 +1000,8 @@ async def _run_morning_confirm(context: ContextTypes.DEFAULT_TYPE, label: str):
         return
     _confirm_in_flight = True
     try:
-        try:
-            text, hot = await asyncio.to_thread(build_morning_confirm, now)
-        except Exception:
-            log.exception("%s failed", label)
-            return
+        # build ล้ม → ปล่อย exception ถึง _run_guarded
+        text, hot = await asyncio.to_thread(build_morning_confirm, now)
         if not text:
             return
         buttons = _watch_buttons(hot)
@@ -987,7 +1024,8 @@ async def _run_morning_confirm(context: ContextTypes.DEFAULT_TYPE, label: str):
 
 async def morning_confirm_job(context: ContextTypes.DEFAULT_TYPE):
     """job รายวัน 10:30: ยืนยันรอบเช้า"""
-    await _run_morning_confirm(context, "morning confirm")
+    await _run_guarded(context, "confirm", "ยืนยันรอบเช้า",
+                       lambda: _run_morning_confirm(context, "morning confirm"))
 
 
 async def startup_confirm_job(context: ContextTypes.DEFAULT_TYPE):
@@ -997,7 +1035,8 @@ async def startup_confirm_job(context: ContextTypes.DEFAULT_TYPE):
     if not (datetime.time(CONFIRM_HOUR, CONFIRM_MINUTE)
             <= now.time() < datetime.time(12, 0)):
         return
-    await _run_morning_confirm(context, "startup morning confirm")
+    await _run_guarded(context, "confirm", "ยืนยันรอบเช้า",
+                       lambda: _run_morning_confirm(context, "startup morning confirm"))
 
 
 # ── แจ้งเตือนเมื่อสถานะหุ้นในลิสต์เปลี่ยน (เช็คช่วงตลาดเปิด) ────
@@ -1157,11 +1196,13 @@ async def _run_earnings_reminder(context: ContextTypes.DEFAULT_TYPE, label: str)
     _remind_in_flight = True
     try:
         sent_any = False
+        errors = []
         for cid in chat_ids:
             try:
                 text = await asyncio.to_thread(build_earnings_reminder, cid)
-            except Exception:
+            except Exception as e:
                 log.exception("%s failed (chat %s)", label, cid)
+                errors.append(e)
                 continue
             if not text:
                 continue
@@ -1170,6 +1211,8 @@ async def _run_earnings_reminder(context: ContextTypes.DEFAULT_TYPE, label: str)
                 sent_any = True
             except Exception:
                 log.exception("send %s failed (chat %s)", label, cid)
+        if errors and not sent_any:
+            raise errors[0]   # build ไม่ได้สักแชท → ให้ _run_guarded แจ้ง/ลองใหม่ (ได้บางแชท = log พอ)
         if sent_any:
             state = _load_digest_state()
             state["remind_last_sent"] = now.date().isoformat()
@@ -1180,7 +1223,8 @@ async def _run_earnings_reminder(context: ContextTypes.DEFAULT_TYPE, label: str)
 
 async def earnings_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     """job รายวัน 08:45: เตือนหุ้นในลิสต์ที่งบออกวันนี้/พรุ่งนี้"""
-    await _run_earnings_reminder(context, "earnings reminder")
+    await _run_guarded(context, "reminder", "เตือนวันงบ",
+                       lambda: _run_earnings_reminder(context, "earnings reminder"))
 
 
 async def startup_reminder_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1189,7 +1233,8 @@ async def startup_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
     if now.time() >= datetime.time(16, 30):
         return
-    await _run_earnings_reminder(context, "startup earnings reminder")
+    await _run_guarded(context, "reminder", "เตือนวันงบ",
+                       lambda: _run_earnings_reminder(context, "startup earnings reminder"))
 
 
 # ── ปฏิทินงบล่วงหน้า (อาทิตย์ 19:00 หรือเรียกเองด้วย "ปฏิทิน") ──
@@ -1272,12 +1317,14 @@ async def _run_calendar(context: ContextTypes.DEFAULT_TYPE, label: str):
 async def calendar_job(context: ContextTypes.DEFAULT_TYPE):
     """job รายวัน 19:00 — anchor รายสัปดาห์ทำให้ส่งจริงแค่ครั้งแรกของสัปดาห์
     ที่คอมเปิดตอน 19:00 (ปกติคือเย็นวันอาทิตย์)"""
-    await _run_calendar(context, "earnings calendar")
+    await _run_guarded(context, "calendar", "ปฏิทินงบ",
+                       lambda: _run_calendar(context, "earnings calendar"))
 
 
 async def startup_calendar_job(context: ContextTypes.DEFAULT_TYPE):
     """ตอนเปิดบอท: สัปดาห์นี้ยังไม่เคยส่งปฏิทิน → ส่งเลย (เปิดคอมวันไหนก็ได้)"""
-    await _run_calendar(context, "startup earnings calendar")
+    await _run_guarded(context, "calendar", "ปฏิทินงบ",
+                       lambda: _run_calendar(context, "startup earnings calendar"))
 
 
 # ── ปุ่มใต้ผลสแกน/สรุปงบ/ยืนยัน: หุ้นละแถว [➕ ติดตาม] [📐 PHASE 0] [📅 หน้างบ] ─────
@@ -1495,12 +1542,9 @@ async def _run_daily_scan(context: ContextTypes.DEFAULT_TYPE, label: str):
         return
     _scan_in_flight = True
     try:
-        try:
-            hits, n, note, unknowns, unk_title, rate_limited = \
-                await asyncio.to_thread(run_best_scan)
-        except Exception:
-            log.exception("%s failed", label)
-            return
+        # build ล้ม → ปล่อย exception ถึง _run_guarded
+        hits, n, note, unknowns, unk_title, rate_limited = \
+            await asyncio.to_thread(run_best_scan)
         report = scanner.format_report(
             hits, n, source_note=note, unknowns=unknowns,
             unknowns_title=unk_title, unknowns_hint="" if unk_title else None,
@@ -1530,7 +1574,8 @@ async def _run_daily_scan(context: ContextTypes.DEFAULT_TYPE, label: str):
 
 async def daily_scan_job(context: ContextTypes.DEFAULT_TYPE):
     """job รายวัน 17:30: สแกนอัตโนมัติหลังปิดตลาด"""
-    await _run_daily_scan(context, "daily scan")
+    await _run_guarded(context, "scan", "สแกนอัตโนมัติ",
+                       lambda: _run_daily_scan(context, "daily scan"))
 
 
 async def startup_scan_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1539,7 +1584,8 @@ async def startup_scan_job(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
     if now.time() < datetime.time(SCAN_HOUR, SCAN_MINUTE):
         return
-    await _run_daily_scan(context, "startup scan")
+    await _run_guarded(context, "scan", "สแกนอัตโนมัติ",
+                       lambda: _run_daily_scan(context, "startup scan"))
 
 
 def _parse_thai_date(s: str):
@@ -2005,11 +2051,13 @@ async def _run_open_positions(context: ContextTypes.DEFAULT_TYPE, label: str):
     _openpos_in_flight = True
     try:
         sent_any = False
+        errors = []
         for cid in chat_ids:
             try:
                 text = await asyncio.to_thread(build_open_positions_report, cid)
-            except Exception:
+            except Exception as e:
                 log.exception("%s failed (chat %s)", label, cid)
+                errors.append(e)
                 continue
             if not text:
                 continue
@@ -2018,6 +2066,8 @@ async def _run_open_positions(context: ContextTypes.DEFAULT_TYPE, label: str):
                 sent_any = True
             except Exception:
                 log.exception("send %s failed (chat %s)", label, cid)
+        if errors and not sent_any:
+            raise errors[0]   # build ไม่ได้สักแชท → ให้ _run_guarded แจ้ง/ลองใหม่ (ได้บางแชท = log พอ)
         if sent_any:
             state = _load_digest_state()
             state["openpos_last_sent"] = now.date().isoformat()
@@ -2028,7 +2078,8 @@ async def _run_open_positions(context: ContextTypes.DEFAULT_TYPE, label: str):
 
 async def open_positions_job(context: ContextTypes.DEFAULT_TYPE):
     """job รายวัน 17:45: สถานะไม้เปิดหลังปิดตลาด (ต่อจากสแกน 17:30)"""
-    await _run_open_positions(context, "open positions")
+    await _run_guarded(context, "openpos", "รายงานไม้เปิด",
+                       lambda: _run_open_positions(context, "open positions"))
 
 
 async def startup_openpos_job(context: ContextTypes.DEFAULT_TYPE):
@@ -2037,7 +2088,8 @@ async def startup_openpos_job(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
     if now.time() < datetime.time(OPENPOS_HOUR, OPENPOS_MINUTE):
         return
-    await _run_open_positions(context, "startup open positions")
+    await _run_guarded(context, "openpos", "รายงานไม้เปิด",
+                       lambda: _run_open_positions(context, "startup open positions"))
 
 
 def build_trades_report(chat_id) -> str:
@@ -2499,6 +2551,27 @@ async def register_commands(app):
 
 # main
 
+async def catchup_job(context: ContextTypes.DEFAULT_TYPE):
+    """วนทุก CATCHUP_INTERVAL: เรียก startup_*_job ของรายงานรายวันซ้ำ — ตัวพวกนั้นมีเงื่อนไข
+    "ถึงเวลาแล้ว + วันนี้ยังไม่ส่ง + หน้าต่างเวลา" ครบอยู่แล้ว จึงวนถี่แค่ไหนก็ไม่ส่งซ้ำ
+
+    เก็บทั้งรอบที่พลาด (เครื่องหลับช่วงเช้า / job queue ข้าม) และรอบที่ล้มแล้ว _run_guarded นับไว้ ·
+    ข้าม job ที่ _done วันนี้และไม่เคยล้ม (ไม่งั้น "ไม่มีอะไรส่ง" จะ build ซ้ำทุกครึ่งชั่วโมง —
+    reminder ยิง Yahoo) · heartbeat ไม่มีขั้น build ไม่เข้า _done เรียกทุกรอบ (กันซ้ำด้วย key) ·
+    ไม่รวม startup_catchup_job (เก็บตกข่าว) — ผูกกับอายุไฟล์ข่าว วันหยุดจะดึงซ้ำทุกครึ่งชั่วโมง"""
+    for name, job in (("heartbeat", startup_heartbeat_job), ("digest", startup_digest_job),
+                      ("confirm", startup_confirm_job), ("reminder", startup_reminder_job),
+                      ("openpos", startup_openpos_job), ("calendar", startup_calendar_job),
+                      ("scan", startup_scan_job)):
+        key = _job_key(name)
+        if _done.get(key) and key not in _fail_counts:
+            continue
+        try:
+            await job(context)
+        except Exception:
+            log.exception("catch-up %s failed", name)
+
+
 EXIT_ALREADY_RUNNING = 3        # มีบอทอีก instance ถือ lock — เริ่ม Bot.bat / run_bot.bat เห็นแล้วจะไม่วน restart
 
 
@@ -2601,6 +2674,9 @@ def main():
     # สแกนชดเชยตอนเปิดคอมค่ำเลย 17:30 (หนักสุด — ยิง Yahoo หลายสิบตัว
     # จึงวางท้ายสุด เงื่อนไขเวลา+กันซ้ำรายวันอยู่ใน job)
     app.job_queue.run_once(startup_scan_job, when=450)
+    # catch-up ทุก 30 นาที: เก็บ job รายวันที่พลาด (เครื่องหลับ) หรือล้ม (_run_guarded นับไว้) —
+    # รอบแรกหลัง startup burst ด้านบนจบ
+    app.job_queue.run_repeating(catchup_job, interval=CATCHUP_INTERVAL, first=CATCHUP_FIRST)
     # ย้าย watchlist.json format เดิม (list) → per-user dict ให้เจ้าของ (ครั้งเดียว)
     stock_core.migrate_legacy_watchlist(_load_chat_ids())
     app.run_polling(drop_pending_updates=True)
