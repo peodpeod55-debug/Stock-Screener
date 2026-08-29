@@ -30,6 +30,7 @@ import set_news
 import stock_core
 import ta_prompt
 import dashboard_feed
+import instance_lock
 from stock_core import (
     format_pct,
     format_signed_pct,
@@ -2498,10 +2499,20 @@ async def register_commands(app):
 
 # main
 
+EXIT_ALREADY_RUNNING = 3        # มีบอทอีก instance ถือ lock — เริ่ม Bot.bat / run_bot.bat เห็นแล้วจะไม่วน restart
+
+
 def main():
     if not BOT_TOKEN:
         print("\n  ⚠️  ไม่พบ BOT_TOKEN — กรุณาใส่ในไฟล์ .env (บรรทัด BOT_TOKEN=...)\n")
         return
+
+    lock = instance_lock.acquire()  # ถือ reference ไว้ตลอดอายุ process (main ไม่คืนจนกว่าบอทหยุด)
+    if lock is None:
+        log.error("บอทรันอยู่แล้วอีก instance (port %d ถูกถือ) — จบตัวนี้ กัน getUpdates Conflict",
+                  instance_lock.LOCK_PORT)
+        print(f"\n  ⚠️  มีบอทอีกตัวรันอยู่แล้ว (port {instance_lock.LOCK_PORT} ถูกถือ) — ปิดตัวนี้\n")
+        raise SystemExit(EXIT_ALREADY_RUNNING)
 
     print("  Bot กำลังทำงาน... (Ctrl+C เพื่อหยุด)")
     print(f"  สแกนอัตโนมัติทุกวันทำการ เวลา {SCAN_HOUR:02d}:{SCAN_MINUTE:02d} น. "
