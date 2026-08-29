@@ -2,23 +2,28 @@
 chcp 65001 >nul
 title Install auto-start
 set "SU=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
+set "LNK=%SU%\StockLookupBot.lnk"
 
 echo.
-echo  This will make the bot start automatically when Windows boots.
+echo  This will make the bot start automatically when Windows boots,
+echo  with no console window (start_bot_hidden.vbs -^> run_bot.bat).
 echo.
 
-(
-  echo @echo off
-  echo start "" /min "%~dp0เริ่ม Bot.bat"
-) > "%SU%\StockLookupBot.bat"
+REM old installer wrote a .bat that opened a console window - replace it
+if exist "%SU%\StockLookupBot.bat" del "%SU%\StockLookupBot.bat"
 
-if exist "%SU%\StockLookupBot.bat" (
-    echo  OK - installed to Startup folder:
-    echo  %SU%\StockLookupBot.bat
-    echo.
-    echo  To remove auto-start later, delete that file.
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('%LNK%');" ^
+  "$s.TargetPath = \"$env:WINDIR\system32\wscript.exe\";" ^
+  "$s.Arguments = '\"%~dp0start_bot_hidden.vbs\"';" ^
+  "$s.WorkingDirectory = '%~dp0';" ^
+  "$s.Save()"
+
+if exist "%LNK%" (
+    echo  OK - installed: %LNK%
+    echo  To remove auto-start later, delete that shortcut.
 ) else (
-    echo  FAILED - could not write to Startup folder.
+    echo  FAILED - could not create the shortcut in the Startup folder.
 )
 echo.
 pause
