@@ -5,7 +5,7 @@
   (stock_core._retry, scanner) หรือกลืนเป็น None — เทสต์ที่ลืม stub จะล้มทันทีพร้อมบอกว่าลืมอะไร
   แทนที่จะ "ผ่านช้า ๆ" หรือได้ None เงียบ ๆ
 - ไฟล์ state ทุกตัว (chat_ids / watchlist / digest_state / watch_state / port_settings /
-  trades_log / lookup_log / .yf_cache) ถูกชี้ไป tmp_path ของ pytest — เทสต์เขียนได้เต็มที่ ของจริงไม่โดน
+  trades_log / lookup_log / .yf_cache / bot_log / scan_log / news_seen) ถูกชี้ไป tmp_path ของ pytest — เทสต์เขียนได้เต็มที่ ของจริงไม่โดน
 """
 import logging
 import os
@@ -55,9 +55,15 @@ def _state_in_tmp(monkeypatch, tmp_path):
     import stock_core
     import telegram_bot as tb
 
+    import scanner
+    import set_news
+
     for name in ("_CHAT_IDS_PATH", "_ALIVE_PATH", "_DIGEST_STATE_PATH", "_WATCH_STATE_PATH", "_PORT_SETTINGS_PATH",
-                 "_HOLIDAYS_PATH"):
+                 "_HOLIDAYS_PATH", "_LOG_PATH"):
         monkeypatch.setattr(tb, name, str(tmp_path / os.path.basename(getattr(tb, name))))
     for name in ("_WATCHLIST_PATH", "_TRADES_LOG_PATH", "_LOOKUP_LOG_PATH", "_NAME_CACHE_PATH", "_EARN_STORE_PATH"):
         monkeypatch.setattr(stock_core, name, str(tmp_path / os.path.basename(getattr(stock_core, name))))
     monkeypatch.setattr(stock_core, "_CACHE_DIR", str(tmp_path))
+    # คำสั่ง "สถานะ" อ่าน scan_log.csv + mtime ของ news_seen.json — ชี้ tmp เช่นกัน (deep review: เติม redirect ก่อนแตะโมดูลพวกนี้)
+    monkeypatch.setattr(scanner, "LOG_PATH", str(tmp_path / "scan_log.csv"))
+    monkeypatch.setattr(set_news, "_SEEN_PATH", str(tmp_path / "news_seen.json"))

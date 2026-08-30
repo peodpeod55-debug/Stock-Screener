@@ -66,7 +66,7 @@ def test_menu_lists_every_feature():
     assert names[:2] == ["scan", "list"]
     assert {"scan", "news", "digest", "confirm", "list", "watch", "unwatch",
             "calendar", "earn", "stats", "shadow", "port", "size", "buy", "sell",
-            "trades", "ta", "mda", "price", "help"} == set(names)
+            "trades", "ta", "mda", "price", "status", "help"} == set(names)
 
 
 def test_every_alias_is_in_menu_and_help_has_direct_handler():
@@ -159,6 +159,7 @@ def test_every_menu_command_routes_not_ticker_lookup(monkeypatch):
     monkeypatch.setattr(tb, "build_watchlist_summary", lambda chat_id: ("ลิสต์", []))
     monkeypatch.setattr(tb.stock_core, "get_watchlist", lambda chat_id: [])
     monkeypatch.setattr(tb, "get_port_size", lambda chat_id: None)
+    monkeypatch.setattr(tb, "build_status_report", lambda chat_id: "สถานะ")
     for cmd, word in tb.SLASH_ALIASES.items():
         if not word:                                    # price — เทสต์แยกด้านบน
             continue

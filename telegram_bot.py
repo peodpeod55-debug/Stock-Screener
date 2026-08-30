@@ -31,6 +31,7 @@ import stock_core
 import ta_prompt
 import dashboard_feed
 import instance_lock
+import bot_status
 from stock_core import (
     format_pct,
     format_signed_pct,
@@ -41,12 +42,13 @@ from stock_core import (
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── log การทำงานลง bot_log.txt (หมุนไฟล์เองเมื่อเกิน 1 MB) ─────
+_LOG_PATH = os.path.join(_BASE_DIR, "bot_log.txt")   # คำสั่ง "สถานะ" นับ WARNING/ERROR วันนี้จากไฟล์นี้
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     handlers=[
         RotatingFileHandler(
-            os.path.join(_BASE_DIR, "bot_log.txt"),
+            _LOG_PATH,
             maxBytes=1_000_000,
             backupCount=2,
             encoding="utf-8",
@@ -54,6 +56,9 @@ logging.basicConfig(
     ],
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
+# apscheduler INFO ("Running job…" / "executed successfully") = 97% ของ log → ตัดทิ้ง
+# ไฟล์ 1 MB ×3 จึงเก็บประวัติได้นานขึ้น ~40 เท่า (ตัว job ล้มยัง log ERROR ผ่าน _run_guarded อยู่)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 
@@ -343,9 +348,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  → วางในแชท Gem พร้อมรูป Weekly + Daily แล้ว Gem วิเคราะห์เลย ไม่ถามกลับ\n"
         "  (หรือกดปุ่ม 📐 ใต้ผลสแกน / สรุปงบ / ยืนยัน / ลิสต์)\n"
         "• <code>คำอธิบายงบ AOT</code> — ลิงก์หน้างบของหุ้นตัวนั้นที่ Earnings Radar (ปุ่ม 📅)\n\n"
+        "<b>สถานะบอท</b>\n"
+        "• <code>สถานะ</code> — รันอยู่ไหม / ต้อง restart ไหม / job วันนี้ครบไหม\n"
+        "  / ข่าว SET สดไหม / error วันนี้ (อ่านจากไฟล์ ไม่ยิง API ตอบทันที)\n\n"
         "ทุกคำสั่งพิมพ์เป็นอังกฤษได้ (ตัวเล็ก-ใหญ่ไม่สำคัญ):\n"
         "<code>scan</code> / <code>news</code> / <code>digest</code> / "
-        "<code>confirm</code> / <code>stats</code> / <code>earn AOT</code> / "
+        "<code>confirm</code> / <code>stats</code> / <code>status</code> / <code>earn AOT</code> / "
         "<code>calendar</code> / <code>shadow</code> / "
         "<code>watch AOT</code> / <code>unwatch AOT</code> / <code>list</code> / "
         "<code>port 500000</code> / <code>size AOT</code> / "
@@ -2215,6 +2223,18 @@ async def _dispatch_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await _reply_long(update.message, result, parse_mode="HTML")
         return
 
+    # สถานะบอท: "สถานะ" — อ่านไฟล์/memory ล้วน ไม่ยิง API ตอบได้ทันที (ไม่ต้องมี "⏳ กำลัง...")
+    if len(tickers) == 1 and tickers[0].lower() in ("สถานะ", "status"):
+        try:
+            result = build_status_report(update.effective_chat.id)
+        except Exception as e:
+            log.exception("status failed")
+            await update.message.reply_text(
+                f"⚠️ ดูสถานะไม่สำเร็จ: {html.escape(str(e))}", parse_mode="HTML")
+            return
+        await _reply_long(update.message, result, parse_mode="HTML")
+        return
+
     # สถิติย้อนหลังจาก scan_log.csv: "สถิติ"
     if len(tickers) == 1 and tickers[0].lower() in ("สถิติ", "stats"):
         await update.message.reply_text(
@@ -2493,6 +2513,20 @@ async def _dispatch_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await asyncio.sleep(0.5)
 
 
+# ── สถานะบอท: "สถานะ" / /status — รวบค่าที่อยู่ใน memory ของบอทส่งให้ bot_status (ไม่ยิง API) ──
+
+def build_status_report(chat_id) -> str:
+    """คำสั่ง "สถานะ": digest_state.json + _done/_fail_counts/_news_fail_count ใน memory + วันหยุด SET
+    + ลิสต์ของ chat นี้ + log/scan_log → bot_status (โมดูลล้วน ไม่ import กลับมาที่นี่ กัน import วน)"""
+    now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
+    st = bot_status.build_status(
+        now, chat_id, digest_state=_load_digest_state(), done=_done, fail_counts=_fail_counts,
+        news_fail_count=_news_fail_count, is_holiday=_is_market_holiday,
+        n_chats=len(_load_chat_ids()), log_path=_LOG_PATH, scan_log_path=scanner.LOG_PATH,
+        max_tries=JOB_MAX_TRIES, catchup_min=CATCHUP_INTERVAL // 60)
+    return bot_status.format_status(st)
+
+
 # ── เมนู "/" ใน Telegram (setMyCommands ตอน start) — ชื่อ a-z0-9_ ≤32, คำอธิบาย ≤256 · ลำดับ = ลำดับในเมนู ──
 
 BOT_COMMANDS = [
@@ -2515,6 +2549,7 @@ BOT_COMMANDS = [
     ("sell", "ปิดไม้: /sell AOT 35.00 — สรุป % กำไรและ R ทันที"),
     ("trades", "ไม้ที่เปิดอยู่ + ผลไม้ที่ปิดแล้ว"),
     ("mda", "ลิงก์คำอธิบายงบของหุ้นตัวนั้นที่ Earnings Radar: /mda AOT (ปุ่ม 📅)"),
+    ("status", "สถานะบอท: รันอยู่ไหม ต้อง restart ไหม job วันนี้ครบไหม ลิสต์/ข่าว SET/error วันนี้ — ไม่ยิง API"),
     ("help", "วิธีใช้ทั้งหมด (คำสั่งพิมพ์ไทย + ตารางเวลาอัตโนมัติ)"),
 ]
 # slash → ข้อความที่ส่งเข้า dispatcher เดิม — ชื่อ slash ตรงกับ alias อังกฤษของทุกคำสั่งอยู่แล้ว

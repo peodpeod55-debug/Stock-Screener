@@ -66,7 +66,7 @@ def test_chat_id_write_goes_to_tmp_not_project(tmp_path):
 
 def test_all_state_paths_point_outside_project():
     names = [(tb, n) for n in ("_CHAT_IDS_PATH", "_ALIVE_PATH", "_DIGEST_STATE_PATH",
-                               "_WATCH_STATE_PATH", "_PORT_SETTINGS_PATH")]
+                               "_WATCH_STATE_PATH", "_PORT_SETTINGS_PATH", "_LOG_PATH")]
     names += [(stock_core, n) for n in ("_WATCHLIST_PATH", "_TRADES_LOG_PATH", "_LOOKUP_LOG_PATH",
                                         "_NAME_CACHE_PATH", "_EARN_STORE_PATH")]
     inside = [n for mod, n in names if os.path.dirname(getattr(mod, n)).startswith(PROJECT)]
