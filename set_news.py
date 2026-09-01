@@ -15,6 +15,7 @@ import os
 import re
 import csv
 import json
+import logging
 import time
 import datetime
 import threading
@@ -22,6 +23,8 @@ from zoneinfo import ZoneInfo
 
 import scanner
 import stock_core
+
+log = logging.getLogger("bot.set_news")
 
 _BKK = ZoneInfo("Asia/Bangkok")
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -290,7 +293,7 @@ def _log_f45_result(entry):
     news_datetime ล่าสุดต่อ symbol อยู่แล้ว จึงได้เลขแก้ไขเองอัตโนมัติ"""
     parsed = entry.get("f45_data")
     if not parsed:
-        return
+        return True  # ไม่มีตัวเลขให้เขียน = ไม่ใช่ความล้มเหลว
     key = (entry["symbol"], parsed.get("period") or "", str(parsed.get("year") or ""))
     new_vals = (f"{parsed['profit_cur'] / 1e6:.2f}",
                 f"{parsed['profit_prior'] / 1e6:.2f}",
@@ -301,13 +304,13 @@ def _log_f45_result(entry):
             for r in csv.DictReader(f):
                 if (r["symbol"], r["period"], r["year"]) == key:
                     last_match = r
-    except FileNotFoundError:
-        pass
+    except OSError:
+        pass  # ไฟล์ไม่มี/อ่านไม่ได้ (เช่น Excel ล็อค) — เทียบไม่ได้ก็ลองเขียนไปเลย
     if last_match is not None and new_vals == (
             last_match.get("profit_mb") or "",
             last_match.get("profit_prior_mb") or "",
             last_match.get("summary") or ""):
-        return  # ฉบับเดิมถูกอ่านซ้ำ — ไม่ใช่ฉบับแก้ไข
+        return True  # ฉบับเดิมถูกอ่านซ้ำ — ไม่ใช่ฉบับแก้ไข (ไฟล์มีเลขนี้แล้ว)
     is_new = not os.path.exists(_RESULTS_PATH)
     try:
         with open(_RESULTS_PATH, "a", newline="", encoding="utf-8-sig") as f:
@@ -326,8 +329,13 @@ def _log_f45_result(entry):
                 f"{g:.1f}" if g is not None else "",
                 new_vals[2],
             ])
-    except Exception:
-        pass  # ไฟล์เปิดค้างใน Excel ฯลฯ — อย่าให้ล้มการแจ้งเตือน
+    except Exception as e:
+        # ไฟล์เปิดค้างใน Excel ฯลฯ — อย่าให้ล้มการแจ้งเตือน แต่ต้องไม่เงียบ:
+        # ผู้เรียกคงตัวนี้ไว้ในคิว f45_backlog ลองเขียนใหม่รอบหน้า
+        log.warning("เขียน earnings_results.csv ไม่ได้ (%s: %s) — %s จะลองใหม่รอบหน้า",
+                    type(e).__name__, e, entry.get("symbol"))
+        return False
+    return True
 
 
 def _log_filing(news_datetime, symbol, kinds):
@@ -345,8 +353,14 @@ def _log_filing(news_datetime, symbol, kinds):
                 symbol,
                 "/".join(kinds),
             ])
-    except Exception:
-        pass  # ไฟล์เปิดค้างใน Excel ฯลฯ — อย่าให้ล้มการแจ้งเตือน
+    except Exception as e:
+        # ไฟล์เปิดค้างใน Excel ฯลฯ — อย่าให้ล้มการแจ้งเตือน แต่ต้องไม่เงียบ:
+        # ผู้เรียกไม่ mark seen แล้วปล่อยรอบถัดไป retry (แถวหายจาก filings_log
+        # = หายจากสรุปงบเช้า + สแกนโหมดข่าว ถาวร)
+        log.warning("เขียน filings_log.csv ไม่ได้ (%s: %s) — %s จะลองใหม่รอบหน้า",
+                    type(e).__name__, e, symbol)
+        return False
+    return True
 
 
 # ── คิว F45 ที่ยังไม่ได้อ่านตัวเลข (วันพีคเกินโควตาต่อรอบ) ──────
@@ -438,34 +452,45 @@ def _attach_f45_summaries(by_symbol):
                          failed=True,
                          corrected=by_symbol[sym].get("f45_corrected", False))
             continue
-        backlog.pop(sym, None)  # ได้เนื้อหาแล้ว — พ้นคิว (parse ไม่ได้ก็ไม่ลองซ้ำ)
         parsed = parse_f45(text)
-        if parsed:
-            summary = format_f45_summary(parsed)
-            if by_symbol[sym].get("f45_corrected"):
-                summary += " (📝 ฉบับแก้ไข)"
-            by_symbol[sym]["f45"] = summary
-            by_symbol[sym]["f45_data"] = parsed
-            _log_f45_result(by_symbol[sym])
+        if not parsed:
+            backlog.pop(sym, None)  # อ่านเนื้อหาได้แต่ parse ไม่ได้ — ไม่ลองซ้ำ
+            continue
+        summary = format_f45_summary(parsed)
+        if by_symbol[sym].get("f45_corrected"):
+            summary += " (📝 ฉบับแก้ไข)"
+        by_symbol[sym]["f45"] = summary
+        by_symbol[sym]["f45_data"] = parsed
+        if _log_f45_result(by_symbol[sym]):
+            backlog.pop(sym, None)  # ตัวเลขลงไฟล์แล้ว — พ้นคิว
+        else:
+            # เขียน earnings_results ไม่ได้ (เช่น Excel ล็อค) — เข้าคิวลองเขียน
+            # รอบหน้า (ไม่นับ tries: ไม่ใช่ลิงก์ตาย แค่ไฟล์ไม่ว่าง — แจ้งเตือน
+            # รอบนี้ยังมีตัวเลขให้ผู้ใช้ตามปกติ)
+            _backlog_put(backlog, sym, targets[sym], by_symbol[sym]["datetime"],
+                         corrected=by_symbol[sym].get("f45_corrected", False))
     for sym in spare:
         item = backlog[sym]
         text = details.get(item["url"])
         if not text:
             item["tries"] = item.get("tries", 0) + 1
             continue
-        del backlog[sym]
         parsed = parse_f45(text)
-        if parsed:
-            try:
-                dt = datetime.datetime.fromisoformat(item["datetime"])
-            except (KeyError, ValueError):
-                dt = datetime.datetime.now(_BKK)
-            summary = format_f45_summary(parsed)
-            if item.get("corrected"):
-                summary += " (📝 ฉบับแก้ไข)"
-            _log_f45_result({"symbol": sym, "datetime": dt,
-                             "f45": summary,
-                             "f45_data": parsed})
+        if not parsed:
+            del backlog[sym]  # อ่านเนื้อหาได้แต่ parse ไม่ได้ — ไม่ลองซ้ำ
+            continue
+        try:
+            dt = datetime.datetime.fromisoformat(item["datetime"])
+        except (KeyError, ValueError):
+            dt = datetime.datetime.now(_BKK)
+        summary = format_f45_summary(parsed)
+        if item.get("corrected"):
+            summary += " (📝 ฉบับแก้ไข)"
+        if _log_f45_result({"symbol": sym, "datetime": dt,
+                            "f45": summary,
+                            "f45_data": parsed}):
+            del backlog[sym]
+        # เขียนล้ม → คงในคิว (ไม่นับ tries) ลองเขียนรอบหน้า
     _save_f45_backlog(backlog)
 
 
@@ -540,9 +565,13 @@ def check_new_earnings_news(max_age_hours: float = 14, days_back: int = 1):
         kind = classify_earnings_news(it["headline"])
         if kind is None or it["id"] in seen:
             continue
-        seen[it["id"]] = it["datetime"].isoformat()
         stock_core.set_manual_earnings_date(it["symbol"], it["datetime"].date())
-        _log_filing(it["datetime"], it["symbol"], [kind])
+        if not _log_filing(it["datetime"], it["symbol"], [kind]):
+            # เขียน filings_log ไม่ได้ (เช่น Excel เปิดค้าง) → ไม่ mark seen +
+            # ไม่แจ้งรอบนี้ — รอบถัดไป (~10 นาที) เห็นข่าวนี้อีกและลองใหม่ทั้งชุด
+            # (แจ้งช้าดีกว่าแถวหายถาวรจากสรุปงบเช้า/สแกนโหมดข่าว)
+            continue
+        seen[it["id"]] = it["datetime"].isoformat()
         if (now - it["datetime"]).total_seconds() / 3600 > max_age_hours:
             continue
         entry = by_symbol.setdefault(it["symbol"], {

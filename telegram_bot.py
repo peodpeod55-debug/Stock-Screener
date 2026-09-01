@@ -843,14 +843,19 @@ async def _run_morning_digest(context: ContextTypes.DEFAULT_TYPE, label: str):
         if not text:
             return
         buttons = _watch_buttons(hot)
-        sent_any = False
+        sent_any, errors = False, []
         for cid in chat_ids:
             try:
                 await _send_long(context.bot, cid, text,
                                  reply_markup=buttons, parse_mode="HTML")
                 sent_any = True
-            except Exception:
+            except Exception as e:
                 log.exception("send %s failed (chat %s)", label, cid)
+                errors.append(e)
+        # ส่งไม่ถึงสักแชท = รายงานหายทั้งวัน — โยนให้ _run_guarded นับ/แจ้ง/ให้
+        # catch-up ลองใหม่ (ได้บางแชท = log พอ — retry จะสแปมแชทที่ได้ไปแล้ว)
+        if errors and not sent_any:
+            raise errors[0]
         # บันทึก "ส่งแล้ว" เฉพาะเมื่อส่งถึงจริงอย่างน้อยหนึ่ง chat —
         # ไม่งั้นเน็ตล่มตอน 08:55 = วันนั้นถูกนับว่าส่งแล้วทั้งที่ไม่มีใครได้
         # และ startup fallback จะไม่ยอมส่งซ้ำ
@@ -1013,14 +1018,18 @@ async def _run_morning_confirm(context: ContextTypes.DEFAULT_TYPE, label: str):
         if not text:
             return
         buttons = _watch_buttons(hot)
-        sent_any = False
+        sent_any, errors = False, []
         for cid in chat_ids:
             try:
                 await _send_long(context.bot, cid, text,
                                  reply_markup=buttons, parse_mode="HTML")
                 sent_any = True
-            except Exception:
+            except Exception as e:
                 log.exception("send %s failed (chat %s)", label, cid)
+                errors.append(e)
+        # ส่งไม่ถึงสักแชท → raise ให้ _run_guarded ลองใหม่ (เหตุผลเดียวกับ digest)
+        if errors and not sent_any:
+            raise errors[0]
         # ส่งถึงจริงอย่างน้อยหนึ่ง chat ค่อยนับว่าส่งแล้ว (เหตุผลเดียวกับ digest)
         if sent_any:
             state = _load_digest_state()
@@ -1217,10 +1226,11 @@ async def _run_earnings_reminder(context: ContextTypes.DEFAULT_TYPE, label: str)
             try:
                 await context.bot.send_message(cid, text, parse_mode="HTML")
                 sent_any = True
-            except Exception:
+            except Exception as e:
                 log.exception("send %s failed (chat %s)", label, cid)
+                errors.append(e)
         if errors and not sent_any:
-            raise errors[0]   # build ไม่ได้สักแชท → ให้ _run_guarded แจ้ง/ลองใหม่ (ได้บางแชท = log พอ)
+            raise errors[0]   # build/ส่ง ไม่สำเร็จสักแชท → ให้ _run_guarded แจ้ง/ลองใหม่ (ได้บางแชท = log พอ)
         if sent_any:
             state = _load_digest_state()
             state["remind_last_sent"] = now.date().isoformat()
@@ -1304,7 +1314,7 @@ async def _run_calendar(context: ContextTypes.DEFAULT_TYPE, label: str):
         return
     _calendar_in_flight = True
     try:
-        sent_any = False
+        sent_any, errors = False, []
         for cid in chat_ids:
             text = build_earnings_calendar(cid)
             if not text:
@@ -1312,8 +1322,12 @@ async def _run_calendar(context: ContextTypes.DEFAULT_TYPE, label: str):
             try:
                 await _send_long(context.bot, cid, text, parse_mode="HTML")
                 sent_any = True
-            except Exception:
+            except Exception as e:
                 log.exception("send %s failed (chat %s)", label, cid)
+                errors.append(e)
+        # มีของจะส่งแต่ไม่ถึงสักแชท → raise ให้ _run_guarded ลองใหม่ (เหตุผลเดียวกับ digest)
+        if errors and not sent_any:
+            raise errors[0]
         if sent_any:
             state = _load_digest_state()
             state["calendar_last_sent"] = anchor
@@ -1454,18 +1468,53 @@ async def _ta_reply(message, raw_symbol: str):
     )
 
 
+async def _validated_watch_add(chat_id: int, ticker: str):
+    """validate กลางของการเพิ่มเข้าลิสต์ (คำสั่ง "ติดตาม" + ปุ่ม ➕) — คืน (status, base):
+    "added" เพิ่มแล้ว · "unchecked" เพิ่มแบบยังเช็คข้อมูลไม่ได้ (Yahoo ล่ม — รับไว้ก่อน)
+    · "rejected" ชื่อเสีย/ไม่มีข้อมูล ไม่เพิ่ม — กันหุ้น no-data (REIT/หุ้นเล็กจากสรุปงบ)
+    ค้างในลิสต์ให้ watch job ไล่ดึงทุก 15 นาทีโดยไม่มีวันสำเร็จ"""
+    base = ticker.upper().strip().replace(".BK", "")
+    # กันชื่อที่ไม่ใช่ ticker (คำไทย/อักขระแปลก) — ของเสียตัวเดียว
+    # ทำข้อความแจ้งเตือนรวม (HTML) ของทั้งลิสต์ส่งไม่ออก
+    if not re.fullmatch(r"[A-Z0-9.&-]{1,15}", base):
+        return "rejected", base
+    # เช็คว่าดึงข้อมูลได้จริงก่อนรับ — กันพิมพ์ผิด (เช่น TSTJ แทน TSTH)
+    try:
+        d = await asyncio.to_thread(stock_core.get_stock_data, base)
+    except Exception:
+        d = False  # Yahoo ล่ม/rate limit — อย่าขวางการเก็บเข้าลิสต์
+    if d is None:
+        return "rejected", base
+    b, _ = stock_core.add_to_watchlist(base, chat_id)
+    return ("unchecked" if d is False else "added"), b
+
+
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     data = q.data or ""
     if data.startswith("watch:"):
-        base, symbols = stock_core.add_to_watchlist(
-            data.split(":", 1)[1], update.effective_chat.id
+        status, base = await _validated_watch_add(
+            update.effective_chat.id, data.split(":", 1)[1]
         )
+        if status == "rejected":
+            await q.answer(f"❌ ไม่พบข้อมูล {base} — ยังไม่เพิ่ม")
+            try:
+                await q.message.reply_text(
+                    f"❌ ไม่พบข้อมูล <b>{html.escape(base)}</b> — "
+                    "เช็คชื่ออีกครั้ง (ยังไม่เพิ่มเข้าลิสต์)",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+            return
+        symbols = stock_core.get_watchlist(update.effective_chat.id)
+        note = (" (เช็คข้อมูลไม่ได้ชั่วคราว — รับไว้ก่อน)"
+                if status == "unchecked" else "")
         await q.answer(f"เพิ่ม {base} เข้าลิสต์แล้ว ({len(symbols)} ตัว)")
         try:
             await q.message.reply_text(
                 f"✅ เพิ่ม <b>{html.escape(base)}</b> เข้าลิสต์แล้ว "
-                f"(รวม {len(symbols)} ตัว) — ดูทั้งหมด: <code>ลิสต์</code>",
+                f"(รวม {len(symbols)} ตัว){note} — ดูทั้งหมด: <code>ลิสต์</code>",
                 parse_mode="HTML",
             )
         except Exception:
@@ -1558,14 +1607,19 @@ async def _run_daily_scan(context: ContextTypes.DEFAULT_TYPE, label: str):
             unknowns_title=unk_title, unknowns_hint="" if unk_title else None,
             rate_limited=rate_limited)
         buttons = _watch_buttons(hits)
-        sent_any = False
+        sent_any, errors = False, []
         for cid in chat_ids:
             try:
                 await _send_long(context.bot, cid, report,
                                  reply_markup=buttons, parse_mode="HTML")
                 sent_any = True
-            except Exception:
+            except Exception as e:
                 log.exception("send scan report failed (chat %s)", cid)
+                errors.append(e)
+        # ส่งไม่ถึงสักแชท → raise ให้ _run_guarded ลองใหม่ (scan_last_run ไม่ถูกเขียน
+        # อยู่แล้ว — retry จะสแกนซ้ำ ซึ่งเป็น path เดิมของ startup fallback)
+        if errors and not sent_any:
+            raise errors[0]
         if sent_any:
             state = _load_digest_state()
             state["scan_last_run"] = now.date().isoformat()
@@ -2072,10 +2126,11 @@ async def _run_open_positions(context: ContextTypes.DEFAULT_TYPE, label: str):
             try:
                 await _send_long(context.bot, cid, text, parse_mode="HTML")
                 sent_any = True
-            except Exception:
+            except Exception as e:
                 log.exception("send %s failed (chat %s)", label, cid)
+                errors.append(e)
         if errors and not sent_any:
-            raise errors[0]   # build ไม่ได้สักแชท → ให้ _run_guarded แจ้ง/ลองใหม่ (ได้บางแชท = log พอ)
+            raise errors[0]   # build/ส่ง ไม่สำเร็จสักแชท → ให้ _run_guarded แจ้ง/ลองใหม่ (ได้บางแชท = log พอ)
         if sent_any:
             state = _load_digest_state()
             state["openpos_last_sent"] = now.date().isoformat()
@@ -2187,7 +2242,9 @@ async def _dispatch_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
         else:
             since_dt = _digest_window_start(now)
             window_label = None
-        result, hot = build_morning_digest(since_dt, now, window_label=window_label)
+        # build อ่าน filings/results CSV ที่โตทุกวัน — วิ่งใน to_thread เหมือน job path
+        result, hot = await asyncio.to_thread(
+            build_morning_digest, since_dt, now, window_label=window_label)
         if not result:
             await update.message.reply_text(
                 f"📭 ไม่มีบริษัทแจ้งงบตั้งแต่ {since_dt:%d/%m %H:%M} น. ครับ"
@@ -2226,7 +2283,9 @@ async def _dispatch_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # สถานะบอท: "สถานะ" — อ่านไฟล์/memory ล้วน ไม่ยิง API ตอบได้ทันที (ไม่ต้องมี "⏳ กำลัง...")
     if len(tickers) == 1 and tickers[0].lower() in ("สถานะ", "status"):
         try:
-            result = build_status_report(update.effective_chat.id)
+            # อ่านหลายไฟล์ (scan_log/bot_log/ลิสต์) — วิ่งใน to_thread ไม่บล็อกบอท
+            result = await asyncio.to_thread(
+                build_status_report, update.effective_chat.id)
         except Exception as e:
             log.exception("status failed")
             await update.message.reply_text(
@@ -2398,25 +2457,14 @@ async def _dispatch_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
             return
         added, rejected, unchecked = [], [], []
         for t in tickers[1:]:
-            base = t.upper().strip().replace(".BK", "")
-            # กันชื่อที่ไม่ใช่ ticker (คำไทย/อักขระแปลก) — ของเสียตัวเดียว
-            # ทำข้อความแจ้งเตือนรวม (HTML) ของทั้งลิสต์ส่งไม่ออก
-            if not re.fullmatch(r"[A-Z0-9.&-]{1,15}", base):
-                rejected.append(t)
-                continue
-            # เช็คว่าดึงข้อมูลได้จริงก่อนรับ — กันพิมพ์ผิด (เช่น TSTJ แทน
-            # TSTH) ค้างในลิสต์ให้บอทไล่ดึงทุก 15 นาทีโดยไม่มีวันสำเร็จ
-            try:
-                d = await asyncio.to_thread(stock_core.get_stock_data, base)
-            except Exception:
-                d = False  # Yahoo ล่ม/rate limit — อย่าขวางการเก็บเข้าลิสต์
-            if d is None:
+            # validate + เพิ่ม ใช้ตัวกลางร่วมกับปุ่ม ➕ (_validated_watch_add)
+            status, base = await _validated_watch_add(update.effective_chat.id, t)
+            if status == "rejected":
                 rejected.append(base)
                 continue
-            b, _ = stock_core.add_to_watchlist(base, update.effective_chat.id)
-            added.append(b)
-            if d is False:
-                unchecked.append(b)
+            added.append(base)
+            if status == "unchecked":
+                unchecked.append(base)
         lines = []
         if added:
             lines.append(f"✅ เพิ่มเข้าลิสต์แล้ว: <b>{html.escape(' '.join(added))}</b>")

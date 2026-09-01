@@ -149,17 +149,32 @@ def _read_lines(path):
         return []
 
 
-def latest_scan(path):
-    """สแกนล่าสุดจาก scan_log.csv: วันที่ของแถวสุดท้าย + ticker ทุกตัวของวันนั้น (ตัด .BK) · None = ไม่มี/พัง"""
+def latest_scan(path, tail_bytes=64 * 1024):
+    """สแกนล่าสุดจาก scan_log.csv: วันที่ของแถวสุดท้าย + ticker ทุกตัวของวันนั้น (ตัด .BK) · None = ไม่มี/พัง
+
+    อ่านเฉพาะท้ายไฟล์ (tail_bytes) — ไฟล์สะสมโตทุกวัน แต่คำตอบอยู่แค่วันล่าสุด
+    บรรทัดแรกหลังจุด seek อาจโดนตัดกลาง → ทิ้ง (ท้าย 64KB ครอบหลายร้อยแถว
+    เกินวันเดียวแน่)"""
     try:
-        with open(path, encoding="utf-8-sig", newline="") as f:
-            rows = [(r["scan_date"], r["ticker"]) for r in csv.DictReader(f)]
-    except (OSError, KeyError, csv.Error):
+        with open(path, "rb") as f:
+            head = f.readline()
+            f.seek(0, os.SEEK_END)
+            start = max(len(head), f.tell() - tail_bytes)
+            f.seek(start)
+            tail = f.read()
+        cols = next(csv.reader([head.decode("utf-8-sig", "replace").strip()]))
+        i_date, i_tick = cols.index("scan_date"), cols.index("ticker")
+        lines = tail.decode("utf-8", "replace").splitlines()
+        if start > len(head) and lines:
+            lines = lines[1:]
+        rows = [r for r in csv.reader(lines) if len(r) > max(i_date, i_tick)]
+    except (OSError, ValueError, csv.Error, StopIteration):
         return None
-    if not rows or not rows[-1][0]:
+    if not rows or not rows[-1][i_date]:
         return None
-    date = rows[-1][0]
-    tickers = [t.removesuffix(".BK") for d, t in rows if d == date and t]
+    date = rows[-1][i_date]
+    tickers = [r[i_tick].removesuffix(".BK")
+               for r in rows if r[i_date] == date and r[i_tick]]
     return {"date": date, "tickers": tickers}
 
 

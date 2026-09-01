@@ -185,7 +185,10 @@ def update_shadow():
     newly_closed, open_, waiting, failed = [], [], 0, []
     for ticker, items in by_ticker.items():
         try:
-            fetched = stock_core.fetch_history(ticker, period="1y")
+            # ราคาจริงไม่ adjust — stop ใน scan_log เป็นราคาจริง ณ วันสแกน และกติกา
+            # ⛔ ของ watch job ก็เทียบราคาซื้อขายจริง (หุ้น SET ขึ้น XD หลังงบบ่อย —
+            # ราคา adjusted จะถูก rescale หนี stop → ⛔ ปลอม/R เพี้ยน cache ถาวร)
+            fetched = stock_core.fetch_history(ticker, period="1y", auto_adjust=False)
         except Exception:
             fetched = None
         if fetched is None:

@@ -67,3 +67,9 @@ def _state_in_tmp(monkeypatch, tmp_path):
     # คำสั่ง "สถานะ" อ่าน scan_log.csv + mtime ของ news_seen.json — ชี้ tmp เช่นกัน (deep review: เติม redirect ก่อนแตะโมดูลพวกนี้)
     monkeypatch.setattr(scanner, "LOG_PATH", str(tmp_path / "scan_log.csv"))
     monkeypatch.setattr(set_news, "_SEEN_PATH", str(tmp_path / "news_seen.json"))
+    # ไม้เงา + ไฟล์สะสมของ set_news — เทสต์แพ็ค Thai delivery แตะทั้งคู่
+    import shadow
+    monkeypatch.setattr(shadow, "SCAN_LOG_PATH", str(tmp_path / "scan_log.csv"))
+    monkeypatch.setattr(shadow, "SHADOW_LOG_PATH", str(tmp_path / "shadow_log.csv"))
+    for name in ("_FILINGS_PATH", "_RESULTS_PATH", "_F45_BACKLOG_PATH"):
+        monkeypatch.setattr(set_news, name, str(tmp_path / os.path.basename(getattr(set_news, name))))

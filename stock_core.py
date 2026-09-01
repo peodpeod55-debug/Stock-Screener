@@ -654,14 +654,18 @@ def get_stock_data(ticker_input: str, log: bool = False):
     return data
 
 
-def fetch_history(ticker_input: str, period: str = "1y"):
-    """ดึงเฉพาะราคาย้อนหลัง (ใช้คำนวณสถิติ) — คืน (used_ticker, DataFrame) หรือ None"""
+def fetch_history(ticker_input: str, period: str = "1y", auto_adjust: bool = True):
+    """ดึงเฉพาะราคาย้อนหลัง (ใช้คำนวณสถิติ) — คืน (used_ticker, DataFrame) หรือ None
+
+    auto_adjust=True (ราคา adjusted) เหมาะกับวัด return/drift (stats, backtest) ·
+    ผู้เรียกที่ต้องเทียบราคากับ "เลขที่จดไว้ในอดีต" (เช่นเส้น ⛔ ของไม้เงา) ต้องส่ง
+    False — ไม่งั้นวัน XD หลังงบ ราคาย้อนหลังถูก rescale แต่เลขที่จดไม่ถูก"""
     ticker = ticker_input.upper().strip()
     candidates = [ticker + ".BK", ticker] if "." not in ticker else [ticker]
     with _FETCH_LOCK:
         for t in candidates:
             s = _yf_ticker(t)
-            h = _retry(lambda s=s: s.history(period=period))
+            h = _retry(lambda s=s: s.history(period=period, auto_adjust=auto_adjust))
             if h is not None and not h.empty:
                 return t, h
     return None
