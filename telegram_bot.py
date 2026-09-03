@@ -548,11 +548,44 @@ def build_news_alert_text(hits) -> str:
 # ── watchdog: ดึงข่าว SET ล้มติดต่อกันต้องไม่เงียบ ──────────────
 # ล้มครั้งเดียวเป็นเรื่องปกติ (เน็ตสะดุด/เว็บช้า) แต่ล้มติดกันหลายรอบ
 # ช่วงฤดูงบ = กำลังพลาดข่าวโดยไม่รู้ตัว — เด้งเตือนครั้งเดียวต่อการล่ม
-# หนึ่งช่วง แล้วแจ้งอีกทีตอนกลับมาดึงได้ (นับใน memory — รีสตาร์ทบอท
-# แล้วเริ่มนับใหม่ ซึ่งโอเค เพราะรีสตาร์ทคือความพยายามแก้อยู่แล้ว)
+# หนึ่งช่วง แล้วแจ้งอีกทีตอนกลับมาดึงได้ (ตัวนับอยู่ใน memory แต่ "กำลังล่มอยู่"
+# จดลงไฟล์ด้วย — รีสตาร์ทกลางช่วงล่มแล้ว ✅ ต้องไม่หาย ดูธง news_outage ข้างล่าง)
 _NEWS_FAIL_ALERT_AFTER = 3   # 3 รอบ x 10 นาที ≈ ล่มต่อเนื่องครึ่งชั่วโมง
 _news_fail_count = 0
 _news_fail_alerted = False
+
+# ล้มติดกันหลายรอบ = เว็บล่ม/โดนบล็อกอยู่ — เปิด Chromium ใหม่ทุก 10 นาทีมีแต่เผา
+# เครื่องเปล่า (และยิ่งดูเป็นบอทในสายตา WAF) → เว้นระยะห่างขึ้นตามความหนัก
+# แต่ไม่เคยหยุดถาวร: เว็บกลับมาเมื่อไหร่ รอบถัดไปก็เจอเอง
+_NEWS_BACKOFF_MIN = 20       # ล้ม 3-4 รอบ (นาที)
+_NEWS_BACKOFF_MID = 40       # ล้ม 5-6 รอบ
+_NEWS_BACKOFF_MAX = 60       # ล้ม ≥7 รอบ — เพดาน
+_news_next_try = None        # เวลาที่อนุญาตให้ poll รอบถัดไป (None = ไม่ติด backoff)
+_news_last_error = None      # (เวลา, สาเหตุสั้น ๆ) ของรอบที่ล้มล่าสุด — โชว์ในคำสั่ง "สถานะ"
+_news_recovery_sent = False  # แจ้ง ✅ ของการล่มรอบนี้ไปแล้ว (กันยิงซ้ำตอนล้างธงบนดิสก์ไม่ได้)
+
+
+def _news_backoff_minutes(fail_count: int) -> int:
+    """เว้นกี่นาทีก่อน poll ข่าวรอบถัดไป — 0 = ยิงตามรอบปกติ (ทุก 10 นาที)"""
+    if fail_count < _NEWS_FAIL_ALERT_AFTER:
+        return 0
+    if fail_count < 5:
+        return _NEWS_BACKOFF_MIN
+    if fail_count < 7:
+        return _NEWS_BACKOFF_MID
+    return _NEWS_BACKOFF_MAX
+
+
+def _news_error_reason(e: BaseException) -> str:
+    """สาเหตุสั้น ๆ ของรอบที่ล้ม — เดิม log ทุกอาการหน้าตาเหมือนกันหมด แยกไม่ออกว่า
+    โดนบล็อก/เจอหน้ากันบอท/เว็บช้า (ใช้ทั้งในธง news_outage และคำสั่ง "สถานะ")"""
+    if isinstance(e, set_news.SetNewsBlocked):
+        return f"Blocked HTTP {e.status}"
+    if isinstance(e, set_news.SetNewsChallenged):
+        return "Challenged (WAF)"
+    if isinstance(e, set_news.PlaywrightTimeout):
+        return f"Timeout {set_news.RESPONSE_TIMEOUT_S}s"
+    return type(e).__name__
 
 
 async def _broadcast(bot, chat_ids, text: str):
@@ -605,11 +638,16 @@ async def _run_guarded(context: ContextTypes.DEFAULT_TYPE, name: str, label: str
 
 
 async def news_monitor_job(context: ContextTypes.DEFAULT_TYPE):
-    global _news_fail_count, _news_fail_alerted
+    global _news_fail_count, _news_fail_alerted, _news_next_try, _news_last_error
+    global _news_recovery_sent
     now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
     if now.weekday() >= 5 or _is_market_holiday(now.date()):
         return
     if not _in_news_window(now.time()):
+        return
+    # ล้มติดกันมาแล้วหลายรอบ → รอให้ครบ backoff ก่อนค่อยเปิดเบราว์เซอร์อีกครั้ง
+    if _news_next_try and now < _news_next_try:
+        log.info("ข่าว SET: backoff — รอบถัดไป %s", f"{_news_next_try:%H:%M}")
         return
     chat_ids = _load_chat_ids()
     if not chat_ids:
@@ -622,26 +660,62 @@ async def news_monitor_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         hits = await asyncio.to_thread(
             set_news.check_new_earnings_news, 14, days_back)
-    except Exception:
+    except Exception as e:
         log.exception("SET news poll failed")
         _news_fail_count += 1
-        if _news_fail_count >= _NEWS_FAIL_ALERT_AFTER and not _news_fail_alerted:
+        reason = _news_error_reason(e)
+        _news_last_error = (now, reason)
+        state = _load_digest_state()
+        outage = state.get("news_outage")
+        if outage:
+            # รีสตาร์ทกลางช่วงล่ม: ตัวนับใน memory เริ่มที่ 1 แต่ธงบอกว่าล้มมา n รอบแล้ว
+            # → รับค่าจากธงมาต่อ ไม่งั้น fails เดินถอยหลัง และ backoff หล่นกลับเป็น 0
+            _news_fail_count = max(_news_fail_count, outage.get("fails") or 0)
+        back = _news_backoff_minutes(_news_fail_count)
+        _news_next_try = now + datetime.timedelta(minutes=back) if back else None
+        if outage:
+            # ยังอยู่ในช่วงล่มเดิม — อัปเดตตัวเลข ไม่แจ้งซ้ำ
             _news_fail_alerted = True
+            outage["fails"] = _news_fail_count
+            outage["reason"] = reason
+            _save_digest_state(state)
+        elif _news_fail_count >= _NEWS_FAIL_ALERT_AFTER and not _news_fail_alerted:
+            _news_fail_alerted = True
+            _news_recovery_sent = False      # ล่มรอบใหม่ = ต้องได้แจ้ง ✅ ตอนหายอีกครั้ง
+            log.warning("ข่าว SET ล้มติดกัน %d รอบ — แจ้งผู้ใช้แล้ว", _news_fail_count)
+            # จดธงลงไฟล์ด้วย: รีสตาร์ทระหว่างที่ยังล่มอยู่ ตัวนับใน memory หายหมด
+            # แต่ ✅ "กลับมาปกติ" ต้องยังได้ส่ง (incident 1 ก.ย. — รอบที่หายไปเงียบ)
+            state["news_outage"] = {"since": now.isoformat(),
+                                    "fails": _news_fail_count, "reason": reason}
+            if not _save_digest_state(state):
+                log.warning("จดธง news_outage ไม่สำเร็จ — ✅ อาจหายถ้ารีสตาร์ท")
             await _broadcast(
                 context.bot, chat_ids,
                 f"⚠️ <b>ดึงข่าวจากเว็บ SET ล้มเหลวติดต่อกัน {_news_fail_count} รอบ</b> "
                 f"(~{_news_fail_count * 10} นาที)\n"
+                f"อาการล่าสุด: <code>{html.escape(reason)}</code>\n"
                 "ช่วงนี้อาจพลาดข่าวแจ้งงบ — สาเหตุที่พบบ่อย: เน็ตมีปัญหา "
                 "หรือเว็บ SET เปลี่ยนโครงสร้าง\n"
                 "เช็คอาการได้ด้วยการรัน <code>python set_news.py</code> ที่เครื่องบอท\n"
                 "ถ้ากลับมาดึงได้ปกติจะแจ้งให้ทราบอีกครั้ง",
             )
         return
-    if _news_fail_alerted:
-        await _broadcast(context.bot, chat_ids,
-                         "✅ ดึงข่าวจากเว็บ SET กลับมาทำงานปกติแล้ว")
+    state = _load_digest_state()
+    outage = state.pop("news_outage", None)
+    if _news_fail_alerted or outage:
+        # ล้างธงลงดิสก์ให้จบ "ก่อน" await — ถือสำเนา state ข้าม await แล้วค่อยเซฟ
+        # จะกลืน key ที่ job อื่นเขียนระหว่างนั้นหาย (เช่น scan_last_run = สแกน 17:30 ซ้ำ)
+        if outage is not None and not _save_digest_state(state):
+            log.warning("ล้างธง news_outage ไม่สำเร็จ — จะไม่แจ้ง ✅ ซ้ำในโปรเซสนี้")
+        if not _news_recovery_sent:
+            _news_recovery_sent = True
+            log.info("ข่าว SET กลับมาปกติ (ล่มตั้งแต่ %s)", (outage or {}).get("since"))
+            await _broadcast(context.bot, chat_ids,
+                             "✅ ดึงข่าวจากเว็บ SET กลับมาทำงานปกติแล้ว")
     _news_fail_count = 0
     _news_fail_alerted = False
+    _news_next_try = None
+    _news_last_error = None
     if not hits:
         return
     text = build_news_alert_text(hits)
@@ -688,10 +762,12 @@ def _load_digest_state():
 
 
 def _save_digest_state(state):
+    """คืน True เมื่อเขียนลงดิสก์สำเร็จ (ผู้เรียกเดิมไม่สนค่า — ที่สนคือคนที่ต้องรู้ว่าล้าง key ได้จริงไหม)"""
     try:
         stock_core.save_json_atomic(_DIGEST_STATE_PATH, state)
     except Exception:
-        pass
+        return False
+    return True
 
 
 def _digest_window_start(now: datetime.datetime) -> datetime.datetime:
@@ -2564,12 +2640,13 @@ async def _dispatch_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
 # ── สถานะบอท: "สถานะ" / /status — รวบค่าที่อยู่ใน memory ของบอทส่งให้ bot_status (ไม่ยิง API) ──
 
 def build_status_report(chat_id) -> str:
-    """คำสั่ง "สถานะ": digest_state.json + _done/_fail_counts/_news_fail_count ใน memory + วันหยุด SET
+    """คำสั่ง "สถานะ": digest_state.json + _done/_fail_counts/_news_* ใน memory + วันหยุด SET
     + ลิสต์ของ chat นี้ + log/scan_log → bot_status (โมดูลล้วน ไม่ import กลับมาที่นี่ กัน import วน)"""
     now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
     st = bot_status.build_status(
         now, chat_id, digest_state=_load_digest_state(), done=_done, fail_counts=_fail_counts,
         news_fail_count=_news_fail_count, is_holiday=_is_market_holiday,
+        news_last_error=_news_last_error, news_next_try=_news_next_try,
         n_chats=len(_load_chat_ids()), log_path=_LOG_PATH, scan_log_path=scanner.LOG_PATH,
         max_tries=JOB_MAX_TRIES, catchup_min=CATCHUP_INTERVAL // 60)
     return bot_status.format_status(st)

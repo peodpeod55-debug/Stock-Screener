@@ -284,6 +284,7 @@ def _status(**over):
         ],
         "watch_n": 26, "n_chats": 1,
         "news_age_h": 2.3, "news_fail_count": 0,
+        "news_last_error": None, "news_next_try": None,
         "log": {"warnings": 0, "errors": 0, "last_error": None},
         "scan": {"date": "2026-08-26", "tickers": ["LUXF", "SR"]},
         "catchup_min": 30, "max_tries": 3,
@@ -344,6 +345,21 @@ def test_format_news_failing_and_last_error_escaped():
     assert "⚠️ ดึงล้มติดกัน 4 รอบ" in msg
     assert "เตือน 2 · error 1" in msg
     assert "↳ error ล่าสุด: x &lt;b&gt;boom&lt;/b&gt;" in msg
+
+
+def test_format_news_line_shows_last_reason_and_backoff():
+    # ล้มติดกันแล้วต้องบอกได้ว่า "เพราะอะไร" และ "รอบหน้าเมื่อไหร่" (incident 1 ก.ย. — log แยกอาการไม่ออก)
+    msg = format_status(_status(news_fail_count=4,
+                                news_last_error=(_at(MON, 10, 42), "Blocked HTTP 403"),
+                                news_next_try=_at(MON, 11, 25)))
+    assert ("📰 ข่าว SET: ข้อมูลอายุ 2.3 ชม. · ⚠️ ดึงล้มติดกัน 4 รอบ · "
+            "ล่าสุด: Blocked HTTP 403 @10:42 · backoff ถึง 11:25") in msg
+
+
+def test_format_news_line_unchanged_when_healthy():
+    msg = format_status(_status(news_last_error=None, news_next_try=None))
+    assert "📰 ข่าว SET: ข้อมูลอายุ 2.3 ชม. · ดึงล้มติดกัน 0 รอบ" in msg
+    assert "ล่าสุด:" not in msg and "backoff" not in msg
 
 
 def test_format_never_fetched_news_and_no_scan():
@@ -437,6 +453,20 @@ def test_build_status_report_wires_bot_memory_and_files(monkeypatch, tmp_path):
     assert "🔍 ยังไม่เคยสแกน" in msg          # scanner.LOG_PATH ชี้ tmp (ว่าง)
     tb._fail_counts.clear()
     tb._done.clear()
+
+
+def test_build_status_report_wires_news_error_and_backoff(monkeypatch):
+    # ค่าใหม่สองตัวต้องเดินทางจาก memory ของ telegram_bot → bot_status (ที่ไม่ import กลับมา)
+    _freeze(monkeypatch, _at(MON, 11, 0))
+    tb._fail_counts.clear()
+    tb._done.clear()
+    monkeypatch.setattr(tb, "_news_fail_count", 3)
+    monkeypatch.setattr(tb, "_news_last_error", (_at(MON, 10, 40), "Challenged (WAF)"))
+    monkeypatch.setattr(tb, "_news_next_try", _at(MON, 11, 20))
+    monkeypatch.setattr(tb, "_load_chat_ids", lambda: [1])
+    monkeypatch.setattr(tb.stock_core, "get_watchlist", lambda chat_id: [])
+    msg = tb.build_status_report(4242)
+    assert "ดึงล้มติดกัน 3 รอบ · ล่าสุด: Challenged (WAF) @10:40 · backoff ถึง 11:20" in msg
 
 
 def test_help_mentions_status():

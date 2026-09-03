@@ -34,18 +34,71 @@ NEWS_PAGE = "https://www.set.or.th/th/market/news-and-alert/news?newsType=compan
 _API_PATH = "/api/cms/v1/news/set"
 PER_PAGE = 3000  # วันพีคฤดูงบ บริษัทแจ้งข่าวรวมกันหลายร้อยรายการ
 
+RESPONSE_TIMEOUT_S = 45  # รอ API ของหน้าเว็บตอบนานสุด (เดิม 90 วิ — ล่มทีนึงเผาเวลาเปล่า)
+FETCH_RETRIES = 1        # โดนบล็อก/กันบอท/รอไม่ทัน → เปิด context ใหม่ลองอีกครั้งเดียว
+
 # เปิดเบราว์เซอร์ทีละตัวพอ (job อัตโนมัติ + คำสั่งมือถือเรียกพร้อมกันได้)
 _FETCH_LOCK = threading.Lock()
 
+# TimeoutError ของ Playwright วางไว้ระดับโมดูล เพื่อให้ผู้เรียก (telegram_bot)
+# แยกอาการ "รอคำตอบไม่ทัน" ออกจากอาการอื่นได้โดยไม่ต้อง import Playwright เอง
+try:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
+except Exception:                       # ไม่มี Playwright = ดึงข่าวไม่ได้อยู่แล้ว
+    class PlaywrightTimeout(Exception):
+        """ตัวแทนตอนเครื่องไม่มี Playwright (ไม่มีใครโยนจริง)"""
+
 
 # ── ดึงข่าวผ่าน Playwright ──────────────────────────────────────
+# อาการที่แยกออกมาได้ ต้องแยกให้ออก: ล้มแบบ "รู้สาเหตุ" จะจบเร็วและอ่าน log รู้เรื่อง
+# ทั้งสามคลาสยังเป็น Exception ธรรมดา — ผู้เรียกที่ except Exception จับได้เหมือนเดิม
 
-def fetch_company_news(days_back: int = 1, timeout_s: int = 90):
-    """คืน list ข่าวบริษัท [{id, datetime, symbol, headline, url}]
-    ตั้งแต่ days_back วันก่อนจนถึงวันนี้ (เรียงใหม่ → เก่า)
 
-    เปิดหน้าเว็บจริงก่อนเพื่อผ่านระบบกันบอท แล้วเรียก API จากในหน้า
-    ล้มเหลว → โยน exception ให้ผู้เรียกจัดการ (อย่าให้บอทหลักล้ม)
+class SetNewsError(Exception):
+    """ดึงข่าวจากเว็บ SET ไม่สำเร็จแบบที่รู้สาเหตุ"""
+
+
+class SetNewsBlocked(SetNewsError):
+    """API ข่าวของ SET ตอบไม่ใช่ 200 (401/403/429/5xx) — โดนกันไว้ ไม่ใช่เว็บช้า"""
+
+    def __init__(self, status: int):
+        super().__init__(f"SET news API ตอบ HTTP {status}")
+        self.status = status
+
+
+class SetNewsChallenged(SetNewsError):
+    """ได้หน้า challenge ของ Incapsula แทนหน้าข่าว — ต้องเปิด session ใหม่"""
+
+
+# ข้อความที่โผล่เฉพาะ "หน้าที่ถูกบล็อกจริง" (เทียบแบบไม่สนตัวพิมพ์)
+_CHALLENGE_MARKERS = ("incapsula incident", "request unsuccessful",
+                      "<title>access denied")
+# ระวัง: เว็บ SET วิ่งผ่าน Incapsula ตลอด Imperva แทรก script นี้ในหน้า "ปกติ" ด้วย
+# → ห้ามนับเป็นสัญญาณบล็อก (ไม่งั้นทุกรอบที่สำเร็จกลายเป็น Challenged = ข่าวหยุดทั้งระบบ)
+# log ไว้เฉย ๆ เพื่อดูจากของจริงว่าหน้าปกติมีมันจริงไหม
+_INCAPSULA_ASSET = "_incapsula_resource"
+
+
+def _is_challenge_html(html: str) -> bool:
+    """True = HTML ที่ได้คือหน้ากันบอท ไม่ใช่หน้าข่าวจริง (ฟังก์ชันล้วน เทสต์ได้)"""
+    low = (html or "").lower()
+    return any(m in low for m in _CHALLENGE_MARKERS)
+
+
+def _timeout_reason(bad, exc):
+    """รอคำตอบ 200 ไม่ทัน — แต่ถ้าระหว่างรอมีใบที่ถูกปฏิเสธ นั่นคือสาเหตุจริง
+
+    SPA ของ SET ยิง XHR ข่าว "หลัง" domcontentloaded เสมอ ตัวเช็คหลัง goto จึงมัก
+    ยังไม่เห็น 403 ที่มาทีหลัง — ถ้าไม่แปลงตรงนี้ log จะบอก 403 แต่ธง/สถานะบอก Timeout
+    """
+    return SetNewsBlocked(bad[0]) if bad else exc
+
+
+def _fetch_once(days_back: int, timeout_s: int):
+    """ดึงหนึ่งครั้ง (เบราว์เซอร์/context/หน้า ชุดเดียว) — ตัวห่อข้างล่างจัดการ retry
+
+    โยน SetNewsBlocked / SetNewsChallenged ทันทีที่รู้ผล ไม่รอ expect_response
+    จนหมดเวลา (incident 1 ก.ย.: ล้ม 16 รอบ รอบละ 90 วิ เพราะรอคำตอบที่ไม่มีวันมา)
     """
     import urllib.parse as up
     from playwright.sync_api import sync_playwright
@@ -69,6 +122,15 @@ def fetch_company_news(days_back: int = 1, timeout_s: int = 90):
         q["perPage"] = str(PER_PAGE)
         route.continue_(url=parts._replace(query=up.urlencode(q)).geturl())
 
+    bad = []            # สถานะ != 200 ที่ API ข่าวตอบกลับมา (ตัวแรกคือสาเหตุจริง)
+
+    def _watch(resp):
+        if _API_PATH not in resp.url or "sourceId=company" not in resp.url:
+            return
+        if resp.status >= 400:  # 3xx = redirect ระหว่างทาง ไม่ใช่การบล็อก
+            log.warning("SET news API ตอบ %s: %s", resp.status, resp.url)
+            bad.append(resp.status)
+
     with _FETCH_LOCK:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -82,17 +144,37 @@ def fetch_company_news(days_back: int = 1, timeout_s: int = 90):
                 # (glob ของ Playwright: "*" เดี่ยวไม่ match "/")
                 ctx.route(lambda url: _API_PATH in url, _rewrite)
                 page = ctx.new_page()
+                # ดักคำตอบทุกใบก่อน goto — predicate ข้างล่างรับเฉพาะ 200
+                # ใบที่ถูกปฏิเสธจึงต้องมีคนเห็น ไม่งั้นเงียบหายไปกับ timeout
+                page.on("response", _watch)
                 # หน้า newsType=company จะเรียก API พร้อม sourceId=company
                 # เอง — รอเก็บคำตอบของคำขอนั้น (ที่ถูกสลับพารามิเตอร์แล้ว)
-                with page.expect_response(
-                    lambda r: _API_PATH in r.url
-                    and "sourceId=company" in r.url
-                    and r.status == 200,
-                    timeout=timeout_s * 1000,
-                ) as resp_info:
-                    page.goto(NEWS_PAGE, wait_until="domcontentloaded",
-                              timeout=timeout_s * 1000)
-                data = resp_info.value.json()
+                try:
+                    with page.expect_response(
+                        lambda r: _API_PATH in r.url
+                        and "sourceId=company" in r.url
+                        and r.status == 200,
+                        timeout=RESPONSE_TIMEOUT_S * 1000,
+                    ) as resp_info:
+                        page.goto(NEWS_PAGE, wait_until="domcontentloaded",
+                                  timeout=timeout_s * 1000)
+                        # หน้าโหลดจบแล้ว = รู้ผลได้เลย ไม่ต้องรอคำตอบที่ไม่มีวันมา
+                        # (โยนออกจากบล็อกนี้ = Playwright ยกเลิกการรอให้เอง)
+                        if bad:
+                            raise SetNewsBlocked(bad[0])
+                        try:
+                            html_now = page.content()
+                        except Exception:
+                            html_now = ""   # หน้ากำลังเปลี่ยนอยู่ — รอคำตอบต่อตามปกติ
+                        if _is_challenge_html(html_now):
+                            raise SetNewsChallenged("ได้หน้ากันบอทของ SET (Incapsula)")
+                        if _INCAPSULA_ASSET in html_now.lower():
+                            log.info("SET news: หน้ามี _Incapsula_Resource แต่ไม่พบ"
+                                     "ข้อความบล็อก — ถือว่าปกติ")
+                    data = resp_info.value.json()
+                except PlaywrightTimeout as e:
+                    # ใบที่ถูกปฏิเสธมาทีหลัง (ตัวเช็คหลัง goto ยังไม่ทันเห็น) = สาเหตุจริง
+                    raise _timeout_reason(bad, e)
             finally:
                 browser.close()
 
@@ -123,6 +205,37 @@ def fetch_company_news(days_back: int = 1, timeout_s: int = 90):
         })
     out.sort(key=lambda x: x["datetime"], reverse=True)
     return out
+
+
+def fetch_company_news(days_back: int = 1, timeout_s: int = RESPONSE_TIMEOUT_S, *,
+                       _fetch=_fetch_once):
+    """คืน list ข่าวบริษัท [{id, datetime, symbol, headline, url}]
+    ตั้งแต่ days_back วันก่อนจนถึงวันนี้ (เรียงใหม่ → เก่า)
+
+    เปิดหน้าเว็บจริงก่อนเพื่อผ่านระบบกันบอท แล้วเรียก API จากในหน้า
+    ล้มเหลว → โยน exception ให้ผู้เรียกจัดการ (อย่าให้บอทหลักล้ม)
+
+    โดนบล็อก/เจอหน้ากันบอท/รอคำตอบไม่ทัน = อาการที่ "เปิด context ใหม่แล้วอาจผ่าน"
+    → ลองใหม่อีก FETCH_RETRIES ครั้งด้วยเบราว์เซอร์ชุดใหม่ · อาการอื่น (เช่น เว็บ
+    เปลี่ยนโครงสร้าง) ลองซ้ำก็ล้มเหมือนเดิม จึงโยนออกไปทันที
+    timeout_s คุมเฉพาะ goto (เปิดหน้า) — ส่วนการรอคำตอบ API ตรึงที่ RESPONSE_TIMEOUT_S เสมอ
+    (ต่างจาก fetch_news_details ที่ timeout_s คุมทั้งสองอย่าง)
+    (_fetch = ทางฉีดตัวดึงปลอมในเทสต์ — จะได้ไม่ต้องมี Playwright)
+    """
+    last_err = None
+    for attempt in range(1, FETCH_RETRIES + 2):
+        t0 = time.monotonic()
+        try:
+            out = _fetch(days_back, timeout_s)
+        except (SetNewsBlocked, SetNewsChallenged, PlaywrightTimeout) as e:
+            last_err = e
+            log.warning("SET news: ดึงล้มเหลว ใน %.1f วิ (ครั้งที่ %d): %s",
+                        time.monotonic() - t0, attempt, e)
+            continue
+        log.info("SET news: ดึง %d ข่าว ใน %.1f วิ (ครั้งที่ %d)",
+                 len(out), time.monotonic() - t0, attempt)
+        return out
+    raise last_err
 
 
 # ── ดึงเนื้อหาข่าวรายตัว (ใช้อ่านแบบ F45) ───────────────────────

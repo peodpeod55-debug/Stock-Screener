@@ -180,7 +180,8 @@ def latest_scan(path, tail_bytes=64 * 1024):
 
 def build_status(now, chat_id, *, digest_state, done, fail_counts, news_fail_count, is_holiday,
                  n_chats, log_path, scan_log_path, max_tries=3, catchup_min=30,
-                 started_at=None, started_commit=None, head_commit=None, root=_BASE_DIR):
+                 started_at=None, started_commit=None, head_commit=None, root=_BASE_DIR,
+                 news_last_error=None, news_next_try=None):
     """รวมสถานะทุกแหล่งเป็น dict เดียวให้ format_status — ไฟล์ไหนหาย/พังก็ได้ค่าว่าง ไม่โยน"""
     return {
         "now": now,
@@ -193,6 +194,8 @@ def build_status(now, chat_id, *, digest_state, done, fail_counts, news_fail_cou
         "n_chats": n_chats,
         "news_age_h": set_news.news_data_age_hours(),
         "news_fail_count": news_fail_count,
+        "news_last_error": news_last_error,     # (เวลา, สาเหตุ) ของรอบที่ล้มล่าสุด
+        "news_next_try": news_next_try,         # ติด backoff อยู่ถึงเมื่อไหร่
         "log": log_today(_read_lines(log_path), now.date().isoformat()),
         "scan": latest_scan(scan_log_path),
         "catchup_min": catchup_min,
@@ -277,6 +280,14 @@ def format_status(st):
     news = "ยังไม่เคยดึงข่าว" if age is None else f"ข้อมูลอายุ {age:.1f} ชม."
     fails = st.get("news_fail_count") or 0
     news += f" · ⚠️ ดึงล้มติดกัน {fails} รอบ" if fails else " · ดึงล้มติดกัน 0 รอบ"
+    # ล้มแล้วต้องบอกได้ว่าอาการอะไร (โดนบล็อก/หน้ากันบอท/ช้า) และรอบหน้าเมื่อไหร่
+    last_err = st.get("news_last_error")
+    if fails and last_err:
+        when, reason = last_err
+        news += f" · ล่าสุด: {html.escape(reason)} @{when:%H:%M}"
+    next_try = st.get("news_next_try")
+    if next_try and next_try > now:
+        news += f" · backoff ถึง {next_try:%H:%M}"
     lines.append(f"📰 ข่าว SET: {news}")
     scan = st.get("scan")
     if scan:
