@@ -73,10 +73,9 @@ class SetNewsChallenged(SetNewsError):
 # ข้อความที่โผล่เฉพาะ "หน้าที่ถูกบล็อกจริง" (เทียบแบบไม่สนตัวพิมพ์)
 _CHALLENGE_MARKERS = ("incapsula incident", "request unsuccessful",
                       "<title>access denied")
-# ระวัง: เว็บ SET วิ่งผ่าน Incapsula ตลอด Imperva แทรก script นี้ในหน้า "ปกติ" ด้วย
-# → ห้ามนับเป็นสัญญาณบล็อก (ไม่งั้นทุกรอบที่สำเร็จกลายเป็น Challenged = ข่าวหยุดทั้งระบบ)
-# log ไว้เฉย ๆ เพื่อดูจากของจริงว่าหน้าปกติมีมันจริงไหม
-_INCAPSULA_ASSET = "_incapsula_resource"
+# ระวัง: เว็บ SET วิ่งผ่าน Incapsula ตลอด — Imperva แทรก script "_Incapsula_Resource"
+# ลงหน้า "ปกติ" ด้วย (ยืนยันจาก log จริง 3 ก.ย. 2026) จึงตั้งใจไม่เอามาเป็น marker
+# (ไม่งั้นทุกรอบที่สำเร็จกลายเป็น Challenged = ข่าวหยุดทั้งระบบ)
 
 
 def _is_challenge_html(html: str) -> bool:
@@ -168,9 +167,6 @@ def _fetch_once(days_back: int, timeout_s: int):
                             html_now = ""   # หน้ากำลังเปลี่ยนอยู่ — รอคำตอบต่อตามปกติ
                         if _is_challenge_html(html_now):
                             raise SetNewsChallenged("ได้หน้ากันบอทของ SET (Incapsula)")
-                        if _INCAPSULA_ASSET in html_now.lower():
-                            log.info("SET news: หน้ามี _Incapsula_Resource แต่ไม่พบ"
-                                     "ข้อความบล็อก — ถือว่าปกติ")
                     data = resp_info.value.json()
                 except PlaywrightTimeout as e:
                     # ใบที่ถูกปฏิเสธมาทีหลัง (ตัวเช็คหลัง goto ยังไม่ทันเห็น) = สาเหตุจริง

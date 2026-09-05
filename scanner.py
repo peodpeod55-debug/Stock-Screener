@@ -11,6 +11,7 @@ import time
 import datetime
 from zoneinfo import ZoneInfo
 
+import dotenv
 from yfinance.exceptions import YFRateLimitError
 
 import stock_core
@@ -27,20 +28,17 @@ MIN_CHANGE_PCT = 2.0    # วันตอบรับงบต้องปิด
 MIN_VOL_RATIO = 1.5     # วอลุ่มวันตอบรับต้องกี่เท่าของค่าเฉลี่ย 20 วัน
 
 
-def _env_value(key: str, default: str = "") -> str:
-    """อ่านค่าจาก environment variable หรือไฟล์ .env ข้างๆ สคริปต์
-    (สคริปต์นี้รันเดี่ยวได้ จึงอ่าน .env เองไม่ต้องพึ่ง telegram_bot)"""
+def _env_value(key: str, default: str = "", env_path: str | None = None) -> str:
+    """อ่านค่าจาก environment variable หรือไฟล์ .env ข้างๆ สคริปต์ ผ่าน python-dotenv
+    (utf-8-sig ทนไฟล์ .env ที่มี BOM — HK/US ใช้ตัวเดียวกัน) — ไม่เรียก load_dotenv()
+    เพราะห้ามแตะ os.environ (สคริปต์นี้รันเดี่ยวได้ จึงอ่าน .env เองไม่ต้องพึ่ง telegram_bot)"""
     val = os.environ.get(key, "").strip()
     if val:
         return val
-    env_path = os.path.join(_BASE_DIR, ".env")
-    if os.path.exists(env_path):
-        with open(env_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith(f"{key}="):
-                    # strip quote ครอบ เผื่อผู้ใช้ใส่ path แบบ "..." หรือ '...'
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    path = env_path or os.path.join(_BASE_DIR, ".env")
+    val = dotenv.dotenv_values(path, encoding="utf-8-sig").get(key)
+    if val is not None and val.strip():
+        return val.strip()
     return default
 
 

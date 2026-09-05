@@ -312,13 +312,15 @@ def test_fetch_once_raises_on_a_real_challenge_page(monkeypatch):
         set_news._fetch_once(1, 45)
 
 
-def test_fetch_once_treats_incapsula_script_as_normal_and_logs_it(monkeypatch, caplog):
+def test_fetch_once_treats_incapsula_script_as_normal_silently(monkeypatch, caplog):
+    """คำถาม "หน้าปกติมี _Incapsula_Resource จริงไหม" ตอบแล้วจาก log จริง 3 ก.ย. 2026 —
+    ไม่ต้อง log INFO ไว้ดูอีก แค่ดึงข่าวต่อไปเงียบๆ"""
     page = FakePage(html='<html><script src="/_Incapsula_Resource?x=1"></script>ข่าว</html>',
                     after_goto=[FakeResponse(200, _PAYLOAD)])
     _fake_stack(monkeypatch, page)
     with caplog.at_level(logging.INFO, logger="bot.set_news"):
         assert len(set_news._fetch_once(1, 45)) == 1
-    assert any("_Incapsula_Resource" in r.getMessage() for r in caplog.records)
+    assert not any("_Incapsula_Resource" in r.getMessage() for r in caplog.records)
 
 
 def test_fetch_once_survives_a_content_error_and_keeps_waiting(monkeypatch):

@@ -178,6 +178,21 @@ def latest_scan(path, tail_bytes=64 * 1024):
     return {"date": date, "tickers": tickers}
 
 
+def _valid_news_outage(outage):
+    """ธง news_outage จาก digest_state.json ต้องเป็น dict ที่มี since แปลงเป็นวันที่ได้ —
+    ไฟล์เพี้ยน/ค่าเก่าจากคนละสคีมาต้องไม่ทำให้ "สถานะ" พังหรือโชว์ขยะ"""
+    if not isinstance(outage, dict):
+        return None
+    since = outage.get("since")
+    if not isinstance(since, str):
+        return None
+    try:
+        datetime.datetime.fromisoformat(since)
+    except ValueError:
+        return None
+    return outage
+
+
 def build_status(now, chat_id, *, digest_state, done, fail_counts, news_fail_count, is_holiday,
                  n_chats, log_path, scan_log_path, max_tries=3, catchup_min=30,
                  started_at=None, started_commit=None, head_commit=None, root=_BASE_DIR,
@@ -196,6 +211,7 @@ def build_status(now, chat_id, *, digest_state, done, fail_counts, news_fail_cou
         "news_fail_count": news_fail_count,
         "news_last_error": news_last_error,     # (เวลา, สาเหตุ) ของรอบที่ล้มล่าสุด
         "news_next_try": news_next_try,         # ติด backoff อยู่ถึงเมื่อไหร่
+        "news_outage": _valid_news_outage(digest_state.get("news_outage")),  # ธงค้างข้ามรีสตาร์ท
         "log": log_today(_read_lines(log_path), now.date().isoformat()),
         "scan": latest_scan(scan_log_path),
         "catchup_min": catchup_min,
@@ -288,6 +304,17 @@ def format_status(st):
     next_try = st.get("news_next_try")
     if next_try and next_try > now:
         news += f" · backoff ถึง {next_try:%H:%M}"
+    # รีสตาร์ทกลางช่วงล่ม: ตัวนับใน memory (fails) เริ่มที่ 0 แต่ digest_state.json ยังมีธง
+    # news_outage ค้างอยู่ — ต้องบอกผู้ใช้ได้ทันที ไม่ใช่รอ poll รอบหน้าล้มซ้ำก่อนถึงจะเห็น
+    outage = st.get("news_outage")
+    if fails == 0 and outage:
+        since = datetime.datetime.fromisoformat(outage["since"])
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=TZ)
+        since_fmt = "%H:%M" if since.date() == now.date() else "%d/%m %H:%M"
+        news += (f" · ⚠️ ธงล่มค้างตั้งแต่ {since:{since_fmt}} "
+                 f"(ล้ม {outage.get('fails') or '?'} รอบ: {html.escape(outage.get('reason') or '')}) "
+                 "— รอ poll ถัดไปยืนยัน")
     lines.append(f"📰 ข่าว SET: {news}")
     scan = st.get("scan")
     if scan:

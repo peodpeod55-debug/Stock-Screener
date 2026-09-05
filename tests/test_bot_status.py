@@ -261,6 +261,26 @@ def test_build_status_defaults_to_process_start_info(tmp_path, monkeypatch):
     assert st["head_commit"] == read_head_commit()
 
 
+def test_build_status_passes_through_a_valid_news_outage_flag(tmp_path, monkeypatch):
+    """restart กลางช่วงล่ม: fails ใน memory เริ่มที่ 0 แต่ digest_state.json ยังมีธง news_outage
+    ค้างอยู่ — build_status ต้องส่งธงนั้นต่อให้ format_status ไม่ทิ้งไปเฉยๆ"""
+    outage = {"since": "2026-08-31T09:40:00+07:00", "fails": 5, "reason": "Blocked HTTP 403"}
+    st = _build(tmp_path, monkeypatch,
+               digest_state={"last_sent": "2026-08-31", "news_outage": outage})
+    assert st["news_outage"] == outage
+
+
+def test_build_status_rejects_a_malformed_news_outage_flag(tmp_path, monkeypatch):
+    st = _build(tmp_path, monkeypatch, digest_state={"news_outage": {"fails": 1}})  # ไม่มี since
+    assert st["news_outage"] is None
+    st = _build(tmp_path, monkeypatch, digest_state={"news_outage": "not a dict"})
+    assert st["news_outage"] is None
+    st = _build(tmp_path, monkeypatch, digest_state={"news_outage": {"since": "ไม่ใช่วันที่"}})
+    assert st["news_outage"] is None
+    st = _build(tmp_path, monkeypatch, digest_state={})   # ไม่มี key เลย
+    assert st["news_outage"] is None
+
+
 # ── format_status: ข้อความ HTML ที่ผู้ใช้เห็น ───────────────────────────────────────
 
 
@@ -284,7 +304,7 @@ def _status(**over):
         ],
         "watch_n": 26, "n_chats": 1,
         "news_age_h": 2.3, "news_fail_count": 0,
-        "news_last_error": None, "news_next_try": None,
+        "news_last_error": None, "news_next_try": None, "news_outage": None,
         "log": {"warnings": 0, "errors": 0, "last_error": None},
         "scan": {"date": "2026-08-26", "tickers": ["LUXF", "SR"]},
         "catchup_min": 30, "max_tries": 3,
@@ -360,6 +380,41 @@ def test_format_news_line_unchanged_when_healthy():
     msg = format_status(_status(news_last_error=None, news_next_try=None))
     assert "📰 ข่าว SET: ข้อมูลอายุ 2.3 ชม. · ดึงล้มติดกัน 0 รอบ" in msg
     assert "ล่าสุด:" not in msg and "backoff" not in msg
+
+
+def test_format_shows_a_persisted_outage_flag_when_memory_counter_is_zero():
+    """รีสตาร์ทกลางช่วงล่ม: _news_fail_count ใน memory เริ่มที่ 0 แต่ digest_state.json
+    ยังมีธง news_outage ค้างอยู่ — ต้องยังบอกผู้ใช้ได้ ไม่ใช่นิ่งเงียบจนกว่า poll รอบหน้าจะล้มซ้ำ"""
+    outage = {"since": _at(MON, 9, 40).isoformat(), "fails": 5, "reason": "Blocked HTTP 403"}
+    msg = format_status(_status(news_fail_count=0, news_outage=outage))
+    assert "ธงล่มค้างตั้งแต่ 09:40" in msg
+    assert "ล้ม 5 รอบ: Blocked HTTP 403" in msg
+    assert "รอ poll ถัดไปยืนยัน" in msg
+    # ธงที่ไม่มี fails (schema เก่า/พัง) ต้องโชว์ "?" ไม่ใช่ข้อความ Python "None" ดิบๆ
+    outage_no_fails = {"since": _at(MON, 9, 40).isoformat(), "reason": "Blocked HTTP 403"}
+    msg2 = format_status(_status(news_fail_count=0, news_outage=outage_no_fails))
+    assert "ล้ม ? รอบ" in msg2
+
+
+def test_format_no_outage_flag_leaves_output_unchanged():
+    msg = format_status(_status(news_fail_count=0, news_outage=None))
+    assert "ธงล่มค้าง" not in msg
+    assert "📰 ข่าว SET: ข้อมูลอายุ 2.3 ชม. · ดึงล้มติดกัน 0 รอบ" in msg
+
+
+def test_format_outage_flag_not_duplicated_when_memory_already_reflects_it():
+    """fails > 0 แปลว่าตัวนับใน memory เห็นการล้มอยู่แล้ว (ข้อความ "ดึงล้มติดกัน n รอบ" บอกอยู่แล้ว)
+    ไม่ต้องมีบรรทัด "ธงล่มค้าง" ซ้ำ"""
+    outage = {"since": _at(MON, 9, 40).isoformat(), "fails": 2, "reason": "Blocked HTTP 403"}
+    msg = format_status(_status(news_fail_count=2, news_outage=outage))
+    assert "ธงล่มค้าง" not in msg
+
+
+def test_format_outage_flag_shows_date_when_since_is_a_different_day():
+    outage = {"since": _at(datetime.date(2026, 8, 30), 22, 15).isoformat(),
+              "fails": 3, "reason": "Timeout"}
+    msg = format_status(_status(news_fail_count=0, news_outage=outage))
+    assert "ธงล่มค้างตั้งแต่ 30/08 22:15" in msg
 
 
 def test_format_never_fetched_news_and_no_scan():

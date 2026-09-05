@@ -11,6 +11,7 @@ from logging.handlers import RotatingFileHandler
 
 from zoneinfo import ZoneInfo
 
+import dotenv
 from yfinance.exceptions import YFRateLimitError
 from telegram import BotCommand, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import NetworkError
@@ -57,24 +58,22 @@ logging.basicConfig(
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 # apscheduler INFO ("Running job…" / "executed successfully") = 97% ของ log → ตัดทิ้ง
-# ไฟล์ 1 MB ×3 จึงเก็บประวัติได้นานขึ้น ~40 เท่า (ตัว job ล้มยัง log ERROR ผ่าน _run_guarded อยู่)
+# ไฟล์ 1 MB ×3 จึงเก็บประวัติได้นานขึ้น ~40 เท่า (ตัว job ล้มยัง log ERROR ผ่าน _run_guarded อยู่ —
+# job สำเร็จ log INFO 1 บรรทัดผ่าน _run_guarded แทน)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 
-def _load_bot_token() -> str:
-    """อ่าน BOT_TOKEN จาก environment variable หรือไฟล์ .env ข้างๆ สคริปต์"""
+def _load_bot_token(env_path: str | None = None) -> str:
+    """อ่าน BOT_TOKEN จาก environment variable หรือไฟล์ .env ข้างๆ สคริปต์ ผ่าน python-dotenv
+    (utf-8-sig ทนไฟล์ .env ที่มี BOM — HK/US ใช้ตัวเดียวกัน) — ไม่เรียก load_dotenv()
+    เพราะห้ามแตะ os.environ (scanner.py อ่าน .env เองแยกอิสระเหมือนกัน)"""
     token = os.environ.get("BOT_TOKEN", "").strip()
     if token:
         return token
-    env_path = os.path.join(_BASE_DIR, ".env")
-    if os.path.exists(env_path):
-        with open(env_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("BOT_TOKEN="):
-                    return line.split("=", 1)[1].strip()
-    return ""
+    path = env_path or os.path.join(_BASE_DIR, ".env")
+    token = dotenv.dotenv_values(path, encoding="utf-8-sig").get("BOT_TOKEN")
+    return token.strip() if token else ""
 
 
 BOT_TOKEN = _load_bot_token()
@@ -633,6 +632,7 @@ async def _run_guarded(context: ContextTypes.DEFAULT_TYPE, name: str, label: str
                     "หยุดลองสำหรับวันนี้ (ดู bot_log.txt)")
         await _broadcast(context.bot, _load_chat_ids(), note)
         return
+    log.info("%s สำเร็จ", label)
     _done[key] = True
     _fail_counts.pop(key, None)
 
@@ -2718,7 +2718,12 @@ async def catchup_job(context: ContextTypes.DEFAULT_TYPE):
     เก็บทั้งรอบที่พลาด (เครื่องหลับช่วงเช้า / job queue ข้าม) และรอบที่ล้มแล้ว _run_guarded นับไว้ ·
     ข้าม job ที่ _done วันนี้และไม่เคยล้ม (ไม่งั้น "ไม่มีอะไรส่ง" จะ build ซ้ำทุกครึ่งชั่วโมง —
     reminder ยิง Yahoo) · heartbeat ไม่มีขั้น build ไม่เข้า _done เรียกทุกรอบ (กันซ้ำด้วย key) ·
-    ไม่รวม startup_catchup_job (เก็บตกข่าว) — ผูกกับอายุไฟล์ข่าว วันหยุดจะดึงซ้ำทุกครึ่งชั่วโมง"""
+    ไม่รวม startup_catchup_job (เก็บตกข่าว) — ผูกกับอายุไฟล์ข่าว วันหยุดจะดึงซ้ำทุกครึ่งชั่วโมง
+
+    ไม่มี due-gate ในนี้ (เวลาถึง/ยังอยู่ในตัว startup_X_job แต่ละอัน) → log แค่ตอนลองใหม่จริง
+    (key เคยล้มวันนี้) ไม่ใช่ทุกรอบที่ไม่ _done — ไม่งั้น heartbeat (ไม่เข้า _done เลย) กับ
+    scan/openpos (ก่อนถึงเวลาของมัน) จะ log ทุก 30 นาทีทั้งวันโดยไม่มีอะไรเกิดขึ้นจริง (~55
+    บรรทัดขยะ/วัน) — job สำเร็จ (แม้จะช้า) มี "<label> สำเร็จ" ของตัวเองบอกเวลาอยู่แล้ว"""
     for name, job in (("heartbeat", startup_heartbeat_job), ("digest", startup_digest_job),
                       ("confirm", startup_confirm_job), ("reminder", startup_reminder_job),
                       ("openpos", startup_openpos_job), ("calendar", startup_calendar_job),
@@ -2726,6 +2731,8 @@ async def catchup_job(context: ContextTypes.DEFAULT_TYPE):
         key = _job_key(name)
         if _done.get(key) and key not in _fail_counts:
             continue
+        if key in _fail_counts:
+            log.info("catch-up: retrying failed job %s", name)
         try:
             await job(context)
         except Exception:

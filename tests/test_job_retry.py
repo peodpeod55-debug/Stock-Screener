@@ -8,6 +8,7 @@ startup_*_job เดิมซ้ำ (มีเงื่อนไขเวลา 
 """
 import asyncio
 import datetime
+import logging
 import os
 import sys
 from types import SimpleNamespace
@@ -63,15 +64,18 @@ def _today():
     return datetime.datetime.now(BKK).date().isoformat()
 
 
-def test_failure_notifies_every_chat_and_counts(env):
+def test_failure_notifies_every_chat_and_counts(env, caplog):
     async def core():
         raise RuntimeError("Yahoo down")
 
-    _run(tb._run_guarded(env.ctx, "digest", "สรุปงบเช้า", core))
+    with caplog.at_level(logging.INFO, logger="bot"):
+        _run(tb._run_guarded(env.ctx, "digest", "สรุปงบเช้า", core))
     assert [cid for cid, _ in env.bot.sent] == [111, 222]
     text = env.bot.sent[0][1]
     assert "สรุปงบเช้า" in text and "Yahoo down" in text and "ลองใหม่" in text and "1/3" in text
     assert tb._fail_counts[("digest", _today())] == 1
+    # ล้ม → ต้องไม่มีบรรทัด "... สำเร็จ" (มีแต่ตอนจบไม่มี exception เท่านั้น)
+    assert not any(r.getMessage().endswith("สำเร็จ") for r in caplog.records if r.name == "bot")
 
 
 def test_gives_up_after_max_tries_then_skips_core(env):
@@ -90,13 +94,19 @@ def test_gives_up_after_max_tries_then_skips_core(env):
     assert len(env.bot.sent) == n_msgs           # และไม่สแปมซ้ำ
 
 
-def test_success_is_silent_and_marks_done(env):
+def test_success_logs_one_line_and_marks_done_but_stays_silent_on_telegram(env, caplog):
+    """สำเร็จ = เงียบฝั่ง Telegram (ไม่มีอะไรผิดปกติให้แจ้ง) แต่ต้อง log INFO 1 บรรทัด
+    ให้ watchdog ภายนอก/คนอ่าน bot_log.txt เห็นว่า job นี้จบจริง"""
     async def core():
         pass
 
-    _run(tb._run_guarded(env.ctx, "digest", "สรุปงบเช้า", core))
+    with caplog.at_level(logging.INFO, logger="bot"):
+        _run(tb._run_guarded(env.ctx, "digest", "สรุปงบเช้า", core))
     assert env.bot.sent == []
     assert tb._done[("digest", _today())] is True
+    records = [r for r in caplog.records if r.name == "bot"]
+    assert len(records) == 1
+    assert records[0].getMessage() == "สรุปงบเช้า สำเร็จ"
 
 
 def test_success_after_failure_clears_fail_count(env):
@@ -154,16 +164,23 @@ def test_catchup_runs_daily_startup_jobs_in_order_not_news(env, monkeypatch):
     assert calls == STARTUP_JOBS                 # เก็บตกข่าว (startup_catchup_job) ไม่อยู่ในรอบ 30 นาที
 
 
-def test_catchup_skips_done_today_but_retries_failed(env, monkeypatch):
+def test_catchup_skips_done_today_but_retries_failed(env, monkeypatch, caplog):
     calls = []
     _fake_startup_jobs(monkeypatch, calls)
     tb._done[("digest", _today())] = True                       # ทำไปแล้ววันนี้ → ข้าม
     tb._done[("scan", _today())] = True
     tb._fail_counts[("scan", _today())] = 1                     # เคยล้ม → ลองใหม่
-    _run(tb.catchup_job(env.ctx))
+    with caplog.at_level(logging.INFO, logger="bot"):
+        _run(tb.catchup_job(env.ctx))
     assert "startup_digest_job" not in calls
     assert "startup_scan_job" in calls
     assert "startup_heartbeat_job" in calls                     # ไม่มี build ไม่เข้า _done — เรียกเสมอ (ถูกกันด้วย key)
+    msgs = [r.getMessage() for r in caplog.records if r.name == "bot"]
+    assert "catch-up: retrying failed job scan" in msgs         # เคยล้ม (_fail_counts มี key) → log ว่ากำลังลองใหม่
+    assert "catch-up: retrying failed job digest" not in msgs   # _done แล้ว ไม่ควรมีบรรทัดนี้
+    # heartbeat ไม่เคยล้ม แค่ยังไม่ถึงเวลา (ไม่มี build ไม่เข้า _done เรียกทุกรอบ) — ไม่ log
+    # (ไม่งั้นสแปม ~55 บรรทัด/วัน ก่อน scan/openpos ถึงเวลา — heartbeat/reminder/digest/confirm/calendar เอง)
+    assert not any(m.startswith("catch-up:") for m in msgs if "scan" not in m)
 
 
 def test_main_registers_catchup_every_30_min(monkeypatch):
